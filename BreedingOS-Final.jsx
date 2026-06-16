@@ -75,9 +75,20 @@ const getStatusColor = (status) => ({
   'Lost - back open': DS.colors.status.open,
 }[status] || DS.colors.textMuted);
 
-const calculateAge = (yob) => {
+const calculateAge = (yobOrDob) => {
+  if (!yobOrDob) return 0;
   const now = new Date();
-  return now.getFullYear() - yob;
+  // Full date of birth (e.g. "2019-04-12") — compute precise age.
+  if (typeof yobOrDob === 'string' && yobOrDob.includes('-')) {
+    const dob = new Date(yobOrDob);
+    if (isNaN(dob.getTime())) return 0;
+    let age = now.getFullYear() - dob.getFullYear();
+    const monthDiff = now.getMonth() - dob.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < dob.getDate())) age--;
+    return age;
+  }
+  // Fallback: year of birth only.
+  return now.getFullYear() - Number(yobOrDob);
 };
 
 const getActionTitleWithMareName = (action, horses) => {
@@ -170,7 +181,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
 
   const horseEvents = events.filter(e => e.horseId === horse.id).sort((a, b) => new Date(b.date) - new Date(a.date));
   const horseActions = actions.filter(a => a.horseId === horse.id);
-  const age = calculateAge(horse.yob);
+  const age = calculateAge(horse.dob || horse.yob);
 
   const handleFileUpload = (e) => {
     const files = e.target.files;
@@ -218,9 +229,43 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               </div>
               <div>
                 <div style={styles.label}>Born</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.yob}</p>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dob ? new Date(horse.dob).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
               </div>
+              <div>
+                <div style={styles.label}>Owner</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.owner || 'Unknown'}</p>
+              </div>
+              <div>
+                <div style={styles.label}>Sire</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.sire || 'Unknown'}</p>
+              </div>
+              <div>
+                <div style={styles.label}>Dam</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dam || 'Unknown'}</p>
+              </div>
+              <div>
+                <div style={styles.label}>Dam-Sire</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.damSire || 'Unknown'}</p>
+              </div>
+              {horse.discipline && (
+                <div>
+                  <div style={styles.label}>Discipline</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.discipline}</p>
+                </div>
+              )}
+              {horse.size && (
+                <div>
+                  <div style={styles.label}>Size</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.size}</p>
+                </div>
+              )}
             </div>
+            {horse.additionalInfo && (
+              <div>
+                <div style={styles.label}>Additional Information</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm, whiteSpace: 'pre-wrap'}}>{horse.additionalInfo}</p>
+              </div>
+            )}
           </div>
 
           {/* Breeding Management */}
@@ -522,7 +567,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: DS.spacing.md }}>
                     <div style={{ flex: 1 }}>
                       <h3 style={styles.h3}>{mare.barnName}</h3>
-                      <p style={styles.bodySmall}>{mare.breed} • {calculateAge(mare.yob)} years old</p>
+                      <p style={styles.bodySmall}>{mare.breed} • {calculateAge(mare.dob || mare.yob)} years old</p>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.md, flexShrink: 0 }}>
                       {mare.breedingStatus && (
@@ -811,7 +856,15 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
           name: h.nickname || h.barnName,
           type: h.type,
           breed: h.breed,
-          age: calculateAge(h.yob),
+          age: calculateAge(h.dob || h.yob),
+          color: h.color,
+          owner: h.owner,
+          sire: h.sire,
+          dam: h.dam,
+          damSire: h.damSire,
+          discipline: h.discipline,
+          size: h.size,
+          additionalInfo: h.additionalInfo,
           breedingStatus: h.breedingStatus,
           plannedStallion: h.plannedStallion,
           foalDueDate: h.foalDueDate,
@@ -1105,7 +1158,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [filterType, setFilterType] = useState('all');
-  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', dob: '', color: '', owner: '', sire: '', dam: '', damSire: '', discipline: '', size: '', additionalInfo: '', type: 'mare' });
   const [showBornModal, setShowBornModal] = useState(false);
   const [selectedBornHorse, setSelectedBornHorse] = useState(null);
   const [foalForm, setFoalForm] = useState({ name: '', gender: 'filly' });
@@ -1113,7 +1166,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const handleAdd = () => {
     if (formData.barnName && formData.breed) {
       onAddHorse(formData);
-      setFormData({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+      setFormData({ barnName: '', nickname: '', breed: '', dob: '', color: '', owner: '', sire: '', dam: '', damSire: '', discipline: '', size: '', additionalInfo: '', type: 'mare' });
       setShowAddForm(false);
     }
   };
@@ -1191,6 +1244,42 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
               <div style={{ marginTop: DS.spacing.lg }}>
                 <label style={styles.label}>Breed</label>
                 <input type="text" value={formData.breed} onChange={(e) => setFormData({...formData, breed: e.target.value})} placeholder="e.g., KWPN" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Date of Birth</label>
+                <input type="date" value={formData.dob} onChange={(e) => setFormData({...formData, dob: e.target.value})} max={new Date().toISOString().split('T')[0]} style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Color</label>
+                <input type="text" value={formData.color} onChange={(e) => setFormData({...formData, color: e.target.value})} placeholder="e.g., Bay, Chestnut, Grey" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Owner</label>
+                <input type="text" value={formData.owner} onChange={(e) => setFormData({...formData, owner: e.target.value})} placeholder="e.g., White Horse Estate" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Sire</label>
+                <input type="text" value={formData.sire} onChange={(e) => setFormData({...formData, sire: e.target.value})} placeholder="e.g., Totilas" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam</label>
+                <input type="text" value={formData.dam} onChange={(e) => setFormData({...formData, dam: e.target.value})} placeholder="e.g., Roma" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam-Sire</label>
+                <input type="text" value={formData.damSire} onChange={(e) => setFormData({...formData, damSire: e.target.value})} placeholder="e.g., Jazz" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Discipline</label>
+                <input type="text" value={formData.discipline} onChange={(e) => setFormData({...formData, discipline: e.target.value})} placeholder="e.g., Dressage, Jumping" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Size</label>
+                <input type="text" value={formData.size} onChange={(e) => setFormData({...formData, size: e.target.value})} placeholder="e.g., 16.2 hands" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Additional Information</label>
+                <textarea value={formData.additionalInfo} onChange={(e) => setFormData({...formData, additionalInfo: e.target.value})} placeholder="Any other notes about this horse" rows={3} style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '88px', resize: 'vertical', fontFamily: DS.typography.family.base}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleAdd} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
@@ -1332,7 +1421,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
             filteredHorses.map(horse => (
               <div key={horse.id} onClick={() => onSelectHorse(horse.id)} style={{...styles.card, marginLeft: 0, marginRight: 0, cursor: 'pointer'}}>
                 <h3 style={styles.h3}>{horse.barnName}</h3>
-                <p style={styles.bodySmall}>{horse.breed} • {horse.type === 'foal' ? `Born ${horse.yob}` : `${calculateAge(horse.yob)} years old`}</p>
+                <p style={styles.bodySmall}>{horse.breed} • {horse.type === 'foal' ? `Born ${horse.yob}` : `${calculateAge(horse.dob || horse.yob)} years old`}</p>
               </div>
             ))
           )}
@@ -1812,14 +1901,24 @@ export default function App() {
   };
 
   const handleAddHorse = (formData) => {
+    const yob = formData.dob
+      ? new Date(formData.dob).getFullYear()
+      : (formData.yob || new Date().getFullYear());
     const newHorse = {
       id: `h${Date.now()}`,
       ...formData,
       name: formData.name || formData.barnName,
       nickname: formData.nickname || formData.barnName,
+      dob: formData.dob || null,
+      yob,
       color: formData.color || 'Bay',
+      owner: formData.owner || 'Unknown',
       sire: formData.sire || 'Unknown',
       dam: formData.dam || 'Unknown',
+      damSire: formData.damSire || 'Unknown',
+      discipline: formData.discipline || '',
+      size: formData.size || '',
+      additionalInfo: formData.additionalInfo || '',
       breedingStatus: formData.type === 'mare' ? 'Waiting for cycle' : null,
       plannedStallion: null,
       expectedFoalColor: null,
