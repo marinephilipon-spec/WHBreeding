@@ -61,6 +61,7 @@ const ACTION_CATEGORIES = [
   { key: 'breed', label: 'Breed / Inseminate' },
   { key: 'drug', label: 'Administer Drug' },
   { key: 'short-cycle', label: 'Short Cycle' },
+  { key: 'foaled', label: 'Foaled Out' },
 ];
 const categoryLabel = (key) =>
   (ACTION_CATEGORIES.find(c => c.key === key) || ACTION_CATEGORIES[0]).label;
@@ -184,6 +185,7 @@ const getEventColor = (event) => {
     case 'breed': return '#5A8784';        // bred / inseminated
     case 'drug': return '#DC8A4C';         // administered drug
     case 'short-cycle': return '#8B7E8A';  // short cycle
+    case 'foaled': return '#6BA881';       // foaled out (gave birth)
     case 'check': return '#3E6FB0';        // general check
     default: return DS.colors.primaryLight;
   }
@@ -291,17 +293,30 @@ function Header({ title, subtitle, onBack, action }) {
 // Every field captured when a horse is first created. Shared between the "Add
 // New Horse" form and the "Edit Profile" form so the two can never drift apart —
 // adding a field here makes it both creatable and editable.
-function HorseFormFields({ formData, setFormData }) {
+// Shared horse create/edit form. `errors` is an optional map of field name to
+// message; a field present in it renders a red border and the message beneath
+// it. Required fields (registered name and breed) always show a red asterisk.
+function HorseFormFields({ formData, setFormData, errors = {} }) {
   const text = (key) => (e) => setFormData({ ...formData, [key]: e.target.value });
+  const RequiredStar = () => <span style={{ color: DS.colors.error, marginLeft: '2px' }}>*</span>;
+  const fieldError = (key) => errors[key] ? (
+    <p style={{ ...styles.bodySmall, color: DS.colors.error, marginTop: DS.spacing.xs }}>{errors[key]}</p>
+  ) : null;
+  const inputStyle = (key) => ({
+    ...styles.input,
+    marginTop: DS.spacing.sm,
+    ...(errors[key] ? { borderColor: DS.colors.error } : {}),
+  });
   return (
     <>
       <div style={{ marginTop: DS.spacing.lg }}>
-        <label style={styles.label}>Barn Name</label>
-        <input type="text" value={formData.barnName || ''} onChange={text('barnName')} placeholder="e.g., Roma" style={{...styles.input, marginTop: DS.spacing.sm}} />
+        <label style={styles.label}>Registered Name<RequiredStar /></label>
+        <input type="text" value={formData.barnName || ''} onChange={text('barnName')} placeholder="e.g., Romanova VH" style={inputStyle('barnName')} />
+        {fieldError('barnName')}
       </div>
       <div style={{ marginTop: DS.spacing.lg }}>
-        <label style={styles.label}>Nickname (optional)</label>
-        <input type="text" value={formData.nickname || ''} onChange={text('nickname')} placeholder="e.g., Rom" style={{...styles.input, marginTop: DS.spacing.sm}} />
+        <label style={styles.label}>Barn Name (nickname)</label>
+        <input type="text" value={formData.nickname || ''} onChange={text('nickname')} placeholder="e.g., Roma" style={{...styles.input, marginTop: DS.spacing.sm}} />
       </div>
       <div style={{ marginTop: DS.spacing.lg }}>
         <label style={styles.label}>Type</label>
@@ -313,8 +328,9 @@ function HorseFormFields({ formData, setFormData }) {
         </select>
       </div>
       <div style={{ marginTop: DS.spacing.lg }}>
-        <label style={styles.label}>Breed</label>
-        <input type="text" value={formData.breed || ''} onChange={text('breed')} placeholder="e.g., KWPN" style={{...styles.input, marginTop: DS.spacing.sm}} />
+        <label style={styles.label}>Breed<RequiredStar /></label>
+        <input type="text" value={formData.breed || ''} onChange={text('breed')} placeholder="e.g., KWPN" style={inputStyle('breed')} />
+        {fieldError('breed')}
       </div>
       <div style={{ marginTop: DS.spacing.lg }}>
         <label style={styles.label}>Date of Birth</label>
@@ -357,6 +373,93 @@ function HorseFormFields({ formData, setFormData }) {
 }
 
 // ============================================================================
+// FILE VIEWER
+// ============================================================================
+
+// Full-screen overlay that renders an uploaded file in place. The bytes are
+// served by the `files` function with their original content type, so images,
+// PDFs and plain text render natively (img / iframe). Anything the browser
+// cannot display inline falls back to an "Open in new tab" link.
+function FileViewer({ file, onClose }) {
+  const src = `/.netlify/functions/files?id=${file.id}`;
+  const type = file.type || '';
+  const isImage = type.startsWith('image/');
+  const isPdf = type === 'application/pdf';
+  const isText = type.startsWith('text/') || type === 'application/json';
+
+  // Load the bytes ourselves into an object URL rather than pointing an <img>/
+  // <iframe> straight at the endpoint. That way a file whose content can't be
+  // served — e.g. one added before file contents were ever stored — shows a
+  // clear message instead of a broken-image icon, and the preview only renders
+  // once we know the bytes actually arrived.
+  const [load, setLoad] = useState({ status: 'loading', url: null });
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = null;
+    setLoad({ status: 'loading', url: null });
+    fetch(src)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setLoad({ status: 'ready', url: objectUrl });
+      })
+      .catch(() => {
+        if (!cancelled) setLoad({ status: 'error', url: null });
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(26, 23, 21, 0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: DS.spacing.lg, zIndex: 400 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: DS.colors.white, borderRadius: DS.radius.lg, boxShadow: DS.shadow.md, width: '100%', maxWidth: '900px', maxHeight: '90vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: DS.spacing.lg, borderBottom: `1px solid ${DS.colors.border}` }}>
+          <p style={{...styles.body, marginTop: 0, marginBottom: 0, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</p>
+          <div style={{ display: 'flex', gap: DS.spacing.md, alignItems: 'center', flexShrink: 0, marginLeft: DS.spacing.md }}>
+            {load.status === 'ready' && (
+              <a href={src} target="_blank" rel="noopener noreferrer" style={{ ...styles.bodySmall, color: DS.colors.primary, textDecoration: 'none', fontWeight: 600 }}>Open in new tab</a>
+            )}
+            <button onClick={onClose} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: DS.colors.text, padding: DS.spacing.sm }} title="Close"><X size={22} /></button>
+          </div>
+        </div>
+        <div style={{ flex: 1, overflow: 'auto', background: DS.colors.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '200px' }}>
+          {load.status === 'loading' ? (
+            <p style={styles.bodySmall}>Loading…</p>
+          ) : load.status === 'error' ? (
+            <div style={{ textAlign: 'center', padding: DS.spacing.xl }}>
+              <FileText size={40} color={DS.colors.textMuted} style={{ marginBottom: DS.spacing.md }} />
+              <p style={styles.body}>This file's contents aren't available to preview.</p>
+              <p style={styles.bodySmall}>It may have been added before file contents were stored. Delete it and upload the file again to view it here.</p>
+            </div>
+          ) : isImage ? (
+            <img src={load.url} alt={file.name} style={{ maxWidth: '100%', maxHeight: '80vh', display: 'block' }} />
+          ) : (isPdf || isText) ? (
+            <iframe src={load.url} title={file.name} style={{ width: '100%', height: '80vh', border: 'none', background: DS.colors.white }} />
+          ) : (
+            <div style={{ textAlign: 'center', padding: DS.spacing.xl }}>
+              <FileText size={40} color={DS.colors.textMuted} style={{ marginBottom: DS.spacing.md }} />
+              <p style={styles.bodySmall}>This file type can't be previewed here.</p>
+              <a href={load.url} download={file.name} style={{ ...styles.body, color: DS.colors.primary, fontWeight: 600 }}>Download it</a>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // HORSE DETAIL SCREEN
 // ============================================================================
 
@@ -366,8 +469,13 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   const [stallion, setStallion] = useState(horse.plannedStallion || '');
   const [onList, setOnList] = useState(horse.onBreedingList);
   const [showFileUpload, setShowFileUpload] = useState(false);
+  const [pendingFile, setPendingFile] = useState(null);
+  const [fileName, setFileName] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [viewingFile, setViewingFile] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState(horse);
+  const [editErrors, setEditErrors] = useState({});
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const fileInputRef = React.useRef(null);
 
@@ -377,6 +485,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
 
   const startEditing = () => {
     setEditForm(horse);
+    setEditErrors({});
     setIsEditing(true);
   };
 
@@ -384,7 +493,14 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   // the barn name (as on creation), and the year-of-birth is recomputed from the
   // date of birth so age stays correct after an edit.
   const handleSaveEdit = () => {
-    if (!editForm.barnName) return;
+    const errors = {};
+    if (!editForm.barnName || !editForm.barnName.trim()) errors.barnName = 'Registered name is required';
+    if (!editForm.breed || !editForm.breed.trim()) errors.breed = 'Breed is required';
+    if (Object.keys(errors).length > 0) {
+      setEditErrors(errors);
+      return;
+    }
+    setEditErrors({});
     const yob = editForm.dateOfBirth
       ? new Date(editForm.dateOfBirth).getFullYear()
       : horse.yob;
@@ -397,27 +513,63 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
     setIsEditing(false);
   };
 
-  const handleFileUpload = (e) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      const file = files[0];
+  // Step 1 of uploading: the user picked a file. Hold onto it and pre-fill the
+  // name field with the original filename (minus extension) so they can rename
+  // it before it is saved.
+  const handleFileSelected = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setPendingFile(file);
+    setFileName(file.name.replace(/\.[^.]+$/, ''));
+  };
+
+  const resetUpload = () => {
+    setShowFileUpload(false);
+    setPendingFile(null);
+    setFileName('');
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // Step 2: actually store the file. The raw bytes go to the `files` function
+  // (Netlify Blobs); only the lightweight metadata — including the user's chosen
+  // display name and the original extension — is kept on the horse record.
+  const handleConfirmUpload = async () => {
+    if (!pendingFile) return;
+    setUploading(true);
+    const id = `f${Date.now()}`;
+    const ext = (pendingFile.name.match(/\.[^.]+$/) || [''])[0];
+    const displayName = (fileName.trim() || pendingFile.name.replace(/\.[^.]+$/, '')) + ext;
+    try {
+      const res = await fetch(`/.netlify/functions/files?id=${id}&name=${encodeURIComponent(displayName)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': pendingFile.type || 'application/octet-stream' },
+        body: pendingFile,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const newFile = {
-        id: `f${Date.now()}`,
-        name: file.name,
-        size: file.size,
-        type: file.type,
+        id,
+        name: displayName,
+        size: pendingFile.size,
+        type: pendingFile.type,
         uploadedDate: new Date().toISOString().split('T')[0],
       };
       const updatedFiles = [...(horse.files || []), newFile];
       onUpdateHorse(horse.id, { ...horse, files: updatedFiles });
-      setShowFileUpload(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      resetUpload();
+    } catch (err) {
+      console.error('Failed to upload file:', err);
+      setUploading(false);
+      alert('Could not upload the file — please check your connection and try again.');
     }
   };
 
   const handleDeleteFile = (fileId) => {
     const updatedFiles = (horse.files || []).filter(f => f.id !== fileId);
     onUpdateHorse(horse.id, { ...horse, files: updatedFiles });
+    // Remove the stored bytes too; ignore failures since the metadata is already
+    // gone and a stray blob is harmless.
+    fetch(`/.netlify/functions/files?id=${fileId}`, { method: 'DELETE' }).catch(() => {});
   };
 
   const headerActions = (
@@ -448,7 +600,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
         <div style={styles.scrollable}>
           <div style={styles.contentPadding}>
             <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-              <HorseFormFields formData={editForm} setFormData={setEditForm} />
+              <HorseFormFields formData={editForm} setFormData={setEditForm} errors={editErrors} />
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleSaveEdit} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save Changes</button>
                 <button onClick={() => setIsEditing(false)} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
@@ -462,7 +614,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
 
   return (
     <div style={styles.page}>
-      <Header title={horse.barnName} subtitle={horse.type.toUpperCase()} onBack={onBack} action={headerActions} />
+      <Header title={horse.barnName} subtitle={horse.nickname && horse.nickname !== horse.barnName ? `${horse.type.toUpperCase()} • BARN NAME: ${horse.nickname.toUpperCase()}` : horse.type.toUpperCase()} onBack={onBack} action={headerActions} />
 
       {showDeleteConfirm && (
         <div
@@ -488,6 +640,10 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
             </div>
           </div>
         </div>
+      )}
+
+      {viewingFile && (
+        <FileViewer file={viewingFile} onClose={() => setViewingFile(null)} />
       )}
 
       <div style={styles.scrollable}>
@@ -722,7 +878,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               <h2 style={styles.h2}>Files & Documents</h2>
               <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
                 {!showFileUpload ? (
-                  <button 
+                  <button
                     onClick={() => setShowFileUpload(true)}
                     style={{...styles.buttonBase, ...styles.buttonPrimary, width: '100%'}}>
                     <Plus size={20} /> Add Document
@@ -732,14 +888,34 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                     <input
                       ref={fileInputRef}
                       type="file"
-                      onChange={handleFileUpload}
+                      onChange={handleFileSelected}
                       style={{ display: 'block', marginBottom: DS.spacing.md, width: '100%', padding: DS.spacing.md, border: `2px dashed ${DS.colors.primary}`, borderRadius: DS.radius.md, cursor: 'pointer', background: DS.colors.primaryVeryLight }}
                     />
-                    <button 
-                      onClick={() => setShowFileUpload(false)}
-                      style={{...styles.buttonBase, background: DS.colors.border, color: DS.colors.text, width: '100%'}}>
-                      Cancel
-                    </button>
+                    {pendingFile && (
+                      <>
+                        <div style={styles.label}>File name</div>
+                        <input
+                          type="text"
+                          value={fileName}
+                          onChange={(e) => setFileName(e.target.value)}
+                          placeholder="Name this file"
+                          style={{ display: 'block', width: '100%', boxSizing: 'border-box', marginTop: DS.spacing.sm, marginBottom: DS.spacing.md, padding: DS.spacing.md, border: `1.5px solid ${DS.colors.border}`, borderRadius: DS.radius.md, fontSize: '16px' }}
+                        />
+                      </>
+                    )}
+                    <div style={{ display: 'flex', gap: DS.spacing.md }}>
+                      <button
+                        onClick={handleConfirmUpload}
+                        disabled={!pendingFile || uploading}
+                        style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1, opacity: (!pendingFile || uploading) ? 0.5 : 1, cursor: (!pendingFile || uploading) ? 'not-allowed' : 'pointer'}}>
+                        {uploading ? 'Uploading…' : 'Upload'}
+                      </button>
+                      <button
+                        onClick={resetUpload}
+                        style={{...styles.buttonBase, background: DS.colors.border, color: DS.colors.text, flex: 1}}>
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -751,15 +927,19 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               ) : (
                 horse.files.map(file => (
                   <div key={file.id} style={{...styles.card, marginLeft: 0, marginRight: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                    <div style={{ flex: 1 }}>
+                    <button
+                      onClick={() => setViewingFile(file)}
+                      style={{ flex: 1, background: 'transparent', border: 'none', textAlign: 'left', cursor: 'pointer', padding: 0 }}
+                      title="View file"
+                    >
                       <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.md }}>
                         <FileText size={24} color={DS.colors.primary} />
                         <div>
-                          <p style={{...styles.body, marginTop: 0}}>{file.name}</p>
+                          <p style={{...styles.body, marginTop: 0, color: DS.colors.primary}}>{file.name}</p>
                           <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>Uploaded {relativeDate(file.uploadedDate)}</p>
                         </div>
                       </div>
-                    </div>
+                    </button>
                     <button
                       onClick={() => handleDeleteFile(file.id)}
                       style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.md }}
@@ -785,9 +965,25 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
 function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggleAction, onDeleteAction, onEditAction }) {
   const [editingAction, setEditingAction] = useState(null);
   const [editForm, setEditForm] = useState({});
+  const [actionFilter, setActionFilter] = useState('all');
 
   const breedingMares = horses.filter(h => h.type === 'mare' && h.onBreedingList);
   const pendingActions = actions.filter(a => !a.done);
+
+  // Tabbed views over the pending reminders, mirroring the Horses page tabs.
+  // "Today" is due exactly today; "This Week" is due within the next 7 days
+  // (today through six days out); "All" is every outstanding reminder.
+  const todayActions = pendingActions.filter(a => a.dueDate === today());
+  const weekActions = pendingActions.filter(a => {
+    const d = getDaysUntilDue(a.dueDate);
+    return d >= 0 && d <= 6;
+  });
+  const actionTabs = [
+    { id: 'all', label: 'All', count: pendingActions.length, list: pendingActions },
+    { id: 'today', label: 'Today', count: todayActions.length, list: todayActions },
+    { id: 'week', label: 'This Week', count: weekActions.length, list: weekActions },
+  ];
+  const visibleActions = (actionTabs.find(t => t.id === actionFilter) || actionTabs[0]).list;
 
   const startEdit = (action) => {
     setEditingAction(action.id);
@@ -874,12 +1070,37 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
           {/* Calendar - Actions */}
           <div style={{ marginTop: DS.spacing['3xl'] }}>
             <h2 style={styles.h2}>📅 Upcoming Actions</h2>
-            {pendingActions.length === 0 ? (
+
+            {/* Tabs: All / Today / This Week */}
+            <div style={{ display: 'flex', gap: DS.spacing.sm, marginBottom: DS.spacing.lg, overflowX: 'auto', paddingBottom: DS.spacing.xs }}>
+              {actionTabs.map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActionFilter(tab.id)}
+                  style={{
+                    padding: `${DS.spacing.sm} ${DS.spacing.lg}`,
+                    border: actionFilter === tab.id ? `2px solid ${DS.colors.primary}` : `1px solid ${DS.colors.border}`,
+                    background: actionFilter === tab.id ? DS.colors.primary : DS.colors.white,
+                    color: actionFilter === tab.id ? 'white' : DS.colors.text,
+                    borderRadius: DS.radius.full,
+                    cursor: 'pointer',
+                    fontWeight: DS.typography.weight.semibold,
+                    fontSize: DS.typography.size.sm,
+                    whiteSpace: 'nowrap',
+                    transition: 'all 0.2s ease',
+                  }}
+                >
+                  {tab.label} ({tab.count})
+                </button>
+              ))}
+            </div>
+
+            {visibleActions.length === 0 ? (
               <div style={{...styles.card, textAlign: 'center', marginLeft: 0, marginRight: 0}}>
-                <p style={styles.bodySmall}>No pending actions</p>
+                <p style={styles.bodySmall}>{actionFilter === 'all' ? 'No pending actions' : actionFilter === 'today' ? 'Nothing due today' : 'Nothing due this week'}</p>
               </div>
             ) : (
-              pendingActions.map(action => (
+              visibleActions.map(action => (
                 <div key={action.id} style={{...styles.card, marginLeft: 0, marginRight: 0}}>
                   {editingAction === action.id ? (
                     <div>
@@ -991,7 +1212,8 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 
     // Category of the action being logged.
     let category = 'check';
-    if (/\bshort[\s-]?cycl/.test(lower)) category = 'short-cycle';
+    if (/\bfoaled?\s*out\b|\bfoaled\b|\bfoaling\b|gave birth|\bdelivered\b/.test(lower)) category = 'foaled';
+    else if (/\bshort[\s-]?cycl/.test(lower)) category = 'short-cycle';
     else if (/\b(bred|breed|breeding|inseminat|covered|live cover|\bai\b)\b/.test(lower)) category = 'breed';
     else if (/\b(administer|administered|drug|inject|injected|dose|dosed|gave|medication|meds?|regumate|altrenogest|oxytocin|prostaglandin|lutalyse|estrumate|hcg|chorulon|deslorelin|sucromate|progesterone|p4)\b/.test(lower)) category = 'drug';
 
@@ -1020,7 +1242,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     };
 
     // Did the message describe something that already happened?
-    const takenVerb = /\b(bred|inseminat|covered|teased|administered|gave|injected|dosed|checked|performed|short[\s-]?cycled|did|done)\b/.test(lower);
+    const takenVerb = /\b(bred|inseminat|covered|teased|administered|gave|injected|dosed|checked|performed|short[\s-]?cycled|foaled|delivered|did|done)\b/.test(lower);
     // Does it describe something to do later?
     const scheduleSignal = dayNumber !== null || daysOffset > 0
       || /\b(remind|reminder|schedule|scheduled|due|need to|needs to|will need|follow ?up|recheck|re-check|book)\b/.test(lower);
@@ -1030,13 +1252,14 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     if (takenVerb) {
       if (category === 'breed') actionTaken = /inseminat/.test(lower) ? 'Inseminated' : 'Bred';
       else if (category === 'short-cycle') actionTaken = 'Short cycled';
+      else if (category === 'foaled') actionTaken = 'Foaled out';
       else if (category === 'drug') actionTaken = drugName ? `Administered ${drugName}` : 'Administered drug';
       else actionTaken = checkTask || 'Check';
     }
     // If nothing was scheduled and we couldn't spot a past-tense verb, treat the
     // message as a logged note so the user still gets an event to keep or edit.
     if (!actionTaken && !scheduleSignal) {
-      actionTaken = checkTask || (category === 'breed' ? 'Bred' : category === 'short-cycle' ? 'Short cycled' : category === 'drug' ? (drugName ? `Administered ${drugName}` : 'Administered drug') : 'Note');
+      actionTaken = checkTask || (category === 'breed' ? 'Bred' : category === 'short-cycle' ? 'Short cycled' : category === 'foaled' ? 'Foaled out' : category === 'drug' ? (drugName ? `Administered ${drugName}` : 'Administered drug') : 'Note');
     }
     const actionTakenDate = actionTaken ? (explicitDate || today()) : '';
 
@@ -1052,6 +1275,8 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
         actionItem = drugName ? `Administer ${drugName}` : 'Administer drug';
       } else if (category === 'short-cycle') {
         actionItem = `Short cycle ${mareLabel}`;
+      } else if (category === 'foaled') {
+        actionItem = `${mareLabel} foaling due`;
       } else {
         actionItem = 'Reminder';
       }
@@ -1370,7 +1595,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                       {/* Action item -> becomes a scheduled reminder */}
                       <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
                         <div style={{...styles.label, color: msg.confirmData.actionItem ? DS.colors.gold : DS.colors.textMuted}}>
-                          → Action Item
+                          → Action Required
                         </div>
                         {msg.confirmData.actionItem ? (
                           <>
@@ -1467,7 +1692,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                         </div>
 
                         <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Item</label>
+                          <label style={styles.label}>Action Required</label>
                           <input
                             type="text"
                             value={editingConfirmation.actionItem}
@@ -1584,16 +1809,24 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
     discipline: '', size: '', additionalInfo: '',
   };
   const [formData, setFormData] = useState(emptyForm);
+  const [formErrors, setFormErrors] = useState({});
   const [showBornModal, setShowBornModal] = useState(false);
   const [selectedBornHorse, setSelectedBornHorse] = useState(null);
   const [foalForm, setFoalForm] = useState({ name: '', gender: 'filly' });
+  const [query, setQuery] = useState('');
 
   const handleAdd = () => {
-    if (formData.barnName && formData.breed) {
-      onAddHorse(formData);
-      setFormData(emptyForm);
-      setShowAddForm(false);
+    const errors = {};
+    if (!formData.barnName || !formData.barnName.trim()) errors.barnName = 'Registered name is required';
+    if (!formData.breed || !formData.breed.trim()) errors.breed = 'Breed is required';
+    if (Object.keys(errors).length > 0) {
+      setFormErrors(errors);
+      return;
     }
+    setFormErrors({});
+    onAddHorse(formData);
+    setFormData(emptyForm);
+    setShowAddForm(false);
   };
 
   const mares = horses.filter(h => h.type === 'mare');
@@ -1609,6 +1842,18 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
     filteredHorses = foalsDue;
   }
 
+  // Free-text search across the registered name, barn name, discipline, breed,
+  // and age (so typing a number like "12" matches 12-year-olds).
+  const q = query.trim().toLowerCase();
+  if (q) {
+    filteredHorses = filteredHorses.filter(h => {
+      const age = h.yob ? String(calculateAge(h.yob)) : '';
+      return [h.barnName, h.nickname, h.name, h.discipline, h.breed, age]
+        .filter(Boolean)
+        .some(v => String(v).toLowerCase().includes(q));
+    });
+  }
+
   const filterOptions = [
     { id: 'all', label: 'All', count: horses.length },
     { id: 'mare', label: 'Mares', count: mares.length },
@@ -1622,6 +1867,26 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
 
       <div style={styles.scrollable}>
         <div style={styles.contentPadding}>
+          {/* Search */}
+          <div style={{ marginBottom: DS.spacing.lg, position: 'relative' }}>
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search by name, age, or discipline…"
+              style={{ ...styles.input, paddingRight: query ? '40px' : DS.spacing.lg }}
+            />
+            {query && (
+              <button
+                onClick={() => setQuery('')}
+                style={{ position: 'absolute', right: DS.spacing.md, top: '50%', transform: 'translateY(-50%)', background: 'transparent', border: 'none', cursor: 'pointer', color: DS.colors.textMuted, padding: DS.spacing.xs, display: 'flex' }}
+                title="Clear search"
+              >
+                <X size={18} />
+              </button>
+            )}
+          </div>
+
           {/* Filter Tabs */}
           <div style={{ display: 'flex', gap: DS.spacing.sm, marginBottom: DS.spacing.xl, overflowX: 'auto', paddingBottom: DS.spacing.md, marginLeft: 0, marginRight: 0 }}>
             {filterOptions.map(option => (
@@ -1649,10 +1914,10 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
           {showAddForm && (
             <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
               <h3 style={styles.h3}>Add New Horse</h3>
-              <HorseFormFields formData={formData} setFormData={setFormData} />
+              <HorseFormFields formData={formData} setFormData={setFormData} errors={formErrors} />
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleAdd} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
-                <button onClick={() => setShowAddForm(false)} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
+                <button onClick={() => { setShowAddForm(false); setFormErrors({}); }} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
               </div>
             </div>
           )}
@@ -1792,6 +2057,9 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
                   <div>
                     <h3 style={styles.h3}>{horse.barnName}</h3>
+                    {horse.nickname && horse.nickname !== horse.barnName && (
+                      <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>Barn name: {horse.nickname}</p>
+                    )}
                     <p style={styles.bodySmall}>{horse.breed} • {horse.type === 'foal' ? `Born ${horse.yob}` : `${calculateAge(horse.yob)} years old`}</p>
                   </div>
                   {horse.status && (
@@ -2076,7 +2344,7 @@ function CalendarScreen({ actions, events = [], horses }) {
 
           {/* Month View */}
           {viewMode === 'month' && (
-            <div style={{...styles.card, marginLeft: 0, marginRight: 0, width: '100%', boxSizing: 'border-box', overflowX: 'auto'}}>
+            <div style={{...styles.card, marginLeft: 0, marginRight: 0, padding: DS.spacing.md, width: '100%', boxSizing: 'border-box'}}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: DS.spacing.xl }}>
                 <button onClick={goToPreviousMonth} style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: DS.spacing.md }}>
                   <ChevronLeft size={24} color={DS.colors.primary} />
@@ -2087,15 +2355,15 @@ function CalendarScreen({ actions, events = [], horses }) {
                 </button>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(80px, 1fr))', gap: '1px', marginBottom: DS.spacing.lg, background: DS.colors.border, padding: '1px', width: '100%' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: '1px', marginBottom: DS.spacing.lg, background: DS.colors.border, padding: '1px', width: '100%' }}>
                 {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-                  <div key={day} style={{ background: DS.colors.white, padding: DS.spacing.md, textAlign: 'center', fontWeight: DS.typography.weight.semibold, fontSize: DS.typography.size.sm, color: DS.colors.textSecondary }}>
+                  <div key={day} style={{ background: DS.colors.white, padding: `${DS.spacing.sm} 0`, textAlign: 'center', fontWeight: DS.typography.weight.semibold, fontSize: DS.typography.size.xs, color: DS.colors.textSecondary }}>
                     {day}
                   </div>
                 ))}
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(80px, 1fr))', gap: '1px', background: DS.colors.border, padding: '1px', width: '100%' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: '1px', background: DS.colors.border, padding: '1px', width: '100%' }}>
                 {days.map((day, i) => {
                   const isToday = isCurrentMonth && day === getTodayNum();
                   const dayDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), day);
@@ -2107,11 +2375,12 @@ function CalendarScreen({ actions, events = [], horses }) {
                       key={i}
                       style={{
                         background: isToday ? DS.colors.primaryVeryLight : DS.colors.white,
-                        padding: `${DS.spacing.md}`,
-                        minHeight: '100px',
+                        padding: DS.spacing.xs,
+                        minHeight: '72px',
                         textAlign: 'left',
                         color: day ? DS.colors.text : DS.colors.textMuted,
                         borderRadius: isToday ? DS.radius.md : '0',
+                        overflow: 'hidden',
                       }}
                     >
                       {day && (
@@ -2187,7 +2456,7 @@ function CalendarScreen({ actions, events = [], horses }) {
             <div style={{...styles.card, marginLeft: 0, marginRight: 0, marginTop: DS.spacing.xl, background: DS.colors.bgAlt, border: `2px solid ${DS.colors.primary}`}}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: DS.spacing.lg }}>
                 <h2 style={{...styles.h2, margin: 0, color: DS.colors.primary}}>
-                  {selectedEvent.dueDate ? 'Action Item' : 'Action Taken'}
+                  {selectedEvent.dueDate ? 'Action Required' : 'Action Taken'}
                 </h2>
                 <button onClick={() => setSelectedEvent(null)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '24px', color: DS.colors.text }}>
                   ✕
