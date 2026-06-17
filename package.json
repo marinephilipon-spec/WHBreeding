@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@netlify/blobs": "^10.7.9",
     "@netlify/database": "^1.0.0",
     "@vitejs/plugin-react": "^4.2.0",
     "drizzle-orm": "^1.0.0-beta.22",

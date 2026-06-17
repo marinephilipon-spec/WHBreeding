@@ -49,14 +49,16 @@ Provide a concise, helpful answer based on the data. Use the horse nicknames/nam
       // Clean up any formatting artifacts
       text = text.replace(/^\{\{/, '').replace(/\}\}$/, '').trim();
 
-      // Persist the question/answer so assistant history survives refreshes.
-      // Wrapped defensively so a database issue never breaks the response.
+      // Persist the question/answer so assistant history survives refreshes,
+      // using Netlify Blobs (no database). Wrapped defensively so a storage
+      // hiccup never breaks the response.
       try {
-        const { db } = await import('../../db/index.js');
-        const { chatHistory } = await import('../../db/schema.js');
-        await db.insert(chatHistory).values({ question, answer: text });
-      } catch (dbError) {
-        console.error('Failed to persist chat history:', dbError);
+        const { getStore } = await import('@netlify/blobs');
+        const history = getStore({ name: 'chat-history', consistency: 'strong' });
+        const key = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        await history.setJSON(key, { question, answer: text, createdAt: new Date().toISOString() });
+      } catch (storeError) {
+        console.error('Failed to persist chat history:', storeError);
       }
 
       return {
