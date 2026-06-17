@@ -47,13 +47,44 @@ const DS = {
 // UTILITIES
 // ============================================================================
 
-const today = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const formatDate = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const today = () => formatDate(new Date());
+
+// The action categories the breeding-log chat can infer. The key is stored on
+// events/actions (as `category`); the label is what the review card and editor
+// show. Keeping them here means the chat parser, the review card, and the edit
+// dropdown all stay in sync.
+const ACTION_CATEGORIES = [
+  { key: 'check', label: 'Check' },
+  { key: 'breed', label: 'Breed / Inseminate' },
+  { key: 'drug', label: 'Administer Drug' },
+  { key: 'short-cycle', label: 'Short Cycle' },
+];
+const categoryLabel = (key) =>
+  (ACTION_CATEGORIES.find(c => c.key === key) || ACTION_CATEGORIES[0]).label;
+
+// Parse a date value into a Date in the LOCAL timezone. A bare "YYYY-MM-DD"
+// string is otherwise parsed by the Date constructor as UTC midnight, which
+// renders as the *previous* day for anyone in a timezone behind UTC — that is
+// why something logged "today" kept showing up as "Yesterday".
+const parseLocalDate = (d) => {
+  if (typeof d === 'string') {
+    const m = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  }
+  return new Date(d);
+};
+
+const addDays = (date, days) => {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
 };
 
 const relativeDate = (d) => {
-  const date = new Date(d);
+  const date = parseLocalDate(d);
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   date.setHours(0, 0, 0, 0);
@@ -64,6 +95,49 @@ const relativeDate = (d) => {
   if (diff > 0 && diff < 7) return `In ${diff} days`;
   if (diff < 0 && diff > -7) return `${-diff} days ago`;
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+};
+
+// Pull an explicit calendar date out of free-form text, e.g. "May 28th, 2026",
+// "28 May", "5/28/2026" or "2026-05-28". Returns a local "YYYY-MM-DD" string, or
+// null when the text contains no date. When no year is given the current year is
+// assumed. This lets the chat log an event on the date the user actually states
+// instead of defaulting to today.
+const MONTHS = {
+  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+  july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+  jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, sept: 8, oct: 9, nov: 10, dec: 11,
+};
+
+const parseExplicitDate = (text) => {
+  const monthNames = Object.keys(MONTHS).join('|');
+  const currentYear = new Date().getFullYear();
+
+  // "May 28th, 2026" / "May 28" / "May 28 2026". The (?!\d) guard stops a bare
+  // year ("May 2026") being misread as a day-of-month.
+  let m = text.match(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?!\\d)(?:st|nd|rd|th)?(?:[,\\s]+(\\d{4}))?`, 'i'));
+  if (m) {
+    return formatDate(new Date(m[3] ? Number(m[3]) : currentYear, MONTHS[m[1].toLowerCase()], Number(m[2])));
+  }
+
+  // "28th May 2026" / "28 May"
+  m = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthNames})(?:[,\\s]+(\\d{4}))?`, 'i'));
+  if (m) {
+    return formatDate(new Date(m[3] ? Number(m[3]) : currentYear, MONTHS[m[2].toLowerCase()], Number(m[1])));
+  }
+
+  // ISO "2026-05-28"
+  m = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+
+  // Numeric "5/28/2026" or "5/28"
+  m = text.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (m) {
+    let year = m[3] ? Number(m[3]) : currentYear;
+    if (year < 100) year += 2000;
+    return formatDate(new Date(year, Number(m[1]) - 1, Number(m[2])));
+  }
+
+  return null;
 };
 
 const getStatusColor = (status) => ({
@@ -86,10 +160,29 @@ const getActionTitleWithMareName = (action, horses) => {
   return `${mareName} - ${action.title}`;
 };
 
+// Action-taken events are shown on the calendar as a colored dot rather than a
+// filled box, with a distinct color per milestone so the timeline is scannable
+// at a glance. The category covers the broad type, but the title/detail is also
+// inspected so the two pregnancy milestones (14-day check vs 28-day heartbeat)
+// and a birth each read as their own color even though they share a category.
+const getEventColor = (event) => {
+  const t = `${event.title || ''} ${event.detail || ''}`.toLowerCase();
+  if (/heartbeat|28[\s-]?day/.test(t)) return '#C84C3C';            // 28-day heartbeat check
+  if (/pregnan|14[\s-]?day/.test(t)) return '#D4A574';             // 14-day pregnancy check
+  if (/birth|foaled|foaling/.test(t)) return '#6BA881';            // gave birth
+  switch (event.type) {
+    case 'breed': return '#5A8784';        // bred / inseminated
+    case 'drug': return '#DC8A4C';         // administered drug
+    case 'short-cycle': return '#8B7E8A';  // short cycle
+    case 'check': return '#3E6FB0';        // general check
+    default: return DS.colors.primaryLight;
+  }
+};
+
 const getDaysUntilDue = (dueDate) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const due = new Date(dueDate);
+  const due = parseLocalDate(dueDate);
   due.setHours(0, 0, 0, 0);
   const diff = due - today;
   return Math.ceil(diff / (1000 * 60 * 60 * 24));
@@ -218,7 +311,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               </div>
               <div>
                 <div style={styles.label}>{horse.dateOfBirth ? 'Date of Birth' : 'Born'}</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dateOfBirth ? new Date(horse.dateOfBirth).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dateOfBirth ? parseLocalDate(horse.dateOfBirth).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
               </div>
               {horse.owner && (
                 <div>
@@ -655,87 +748,121 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
   const [editingConfirmation, setEditingConfirmation] = useState(null);
   const [chatMode, setChatMode] = useState('log'); // 'log' or 'ask'
 
-  const parseInput = (text) => {
-    // Simple parser - in production this would use AI
-    const horseMatches = horses.map(h => h.barnName.toLowerCase()).join('|');
-    const horseRegex = new RegExp(`(${horseMatches})`, 'i');
-    const horseMatch = text.match(horseRegex);
-    
-    const horse = horseMatch ? horses.find(h => h.barnName.toLowerCase() === horseMatch[0].toLowerCase()) : null;
-    
-    let actionType = 'check';
-    let title = 'Event';
-    let detail = text;
-    let actionCategory = 'taken';
-    let daysOffset = 0;
-    
-    // Extract timeframe mentions
-    const daysMatch = text.match(/(\d+)\s*(?:day|days)/i);
-    const weeksMatch = text.match(/(\d+)\s*(?:week|weeks)/i);
-    
-    if (daysMatch) {
-      daysOffset = parseInt(daysMatch[1]);
-      actionCategory = 'upcoming';
-    } else if (weeksMatch) {
-      daysOffset = parseInt(weeksMatch[1]) * 7;
-      actionCategory = 'upcoming';
-    }
-    
-    // Detect if it's a breeding scenario
-    if (text.toLowerCase().includes('bred')) {
-      actionType = 'breeding';
-      
-      // If there's a timeframe mentioned after bred
-      if (daysOffset > 0) {
-        title = `Check ${horse?.nickname || horse?.barnName || 'mare'} for pregnancy in ${daysOffset} day${daysOffset !== 1 ? 's' : ''}`;
-        detail = text;
-        actionCategory = 'upcoming';
-      } else {
-        title = 'Bred';
-        detail = text;
-        actionCategory = 'taken';
-      }
-    } else if (text.toLowerCase().includes('teased')) {
-      title = 'Teased';
-      detail = 'Positive to teaser';
-      actionCategory = 'taken';
-    } else if (text.toLowerCase().includes('ultrasound') || text.toLowerCase().includes('check')) {
-      if (daysOffset > 0) {
-        title = `Check ${horse?.nickname || horse?.barnName || 'mare'} - Ultrasound in ${daysOffset} day${daysOffset !== 1 ? 's' : ''}`;
-        detail = text;
-        actionCategory = 'upcoming';
-      } else {
-        title = 'Ultrasound Check';
-        detail = text;
-        actionCategory = 'taken';
-      }
-    } else if (text.toLowerCase().includes('schedule') || text.toLowerCase().includes('due') || text.toLowerCase().includes('need')) {
-      actionCategory = 'upcoming';
-      if (text.toLowerCase().includes('ultrasound')) {
-        title = 'Schedule ultrasound';
-      } else if (text.toLowerCase().includes('breed')) {
-        title = 'Schedule breeding';
-      } else {
-        title = 'Upcoming action';
-      }
-    }
+  // Infer the structured fields the user wants out of a free-form chat message:
+  // the category, the mare, an action that was taken (with the date it was taken),
+  // an action item to schedule (with its due date), and an additional note. Any
+  // field can be left blank — a message can describe only something that happened,
+  // only an upcoming reminder, or both at once. Everything is editable afterwards.
+  const parseInput = (text, fallbackHorse = null) => {
+    const lower = text.toLowerCase();
 
-    // Calculate due date
-    let dueDate = today();
-    if (daysOffset > 0) {
-      const d = new Date();
-      d.setDate(d.getDate() + daysOffset);
-      dueDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    // Identify which horse the message is about. If the message names no horse
+    // (e.g. a follow-up "remind me at day 28"), fall back to the horse the
+    // conversation was already about.
+    const horseMatches = horses.map(h => h.barnName.toLowerCase()).join('|');
+    const horseMatch = horseMatches ? text.match(new RegExp(`(${horseMatches})`, 'i')) : null;
+    const horse = horseMatch
+      ? horses.find(h => h.barnName.toLowerCase() === horseMatch[0].toLowerCase())
+      : fallbackHorse;
+
+    const mareLabel = horse?.nickname || horse?.barnName || 'the mare';
+
+    // Pull timing signals out of the text.
+    const explicitDate = parseExplicitDate(text);          // "May 28th, 2026"
+    const dayNumberMatch = lower.match(/\bday\s+(\d+)\b/);  // "day 28" -> day of the cycle
+    const dayNumber = dayNumberMatch ? parseInt(dayNumberMatch[1], 10) : null;
+    const daysMatch = lower.match(/(\d+)\s*(?:day|days)\b/); // "in 28 days" -> from today
+    const weeksMatch = lower.match(/(\d+)\s*(?:week|weeks)\b/);
+    let daysOffset = 0;
+    if (daysMatch && dayNumber === null) daysOffset = parseInt(daysMatch[1], 10);
+    else if (weeksMatch) daysOffset = parseInt(weeksMatch[1], 10) * 7;
+
+    // Category of the action being logged.
+    let category = 'check';
+    if (/\bshort[\s-]?cycl/.test(lower)) category = 'short-cycle';
+    else if (/\b(bred|breed|breeding|inseminat|covered|live cover|\bai\b)\b/.test(lower)) category = 'breed';
+    else if (/\b(administer|administered|drug|inject|injected|dose|dosed|gave|medication|meds?|regumate|altrenogest|oxytocin|prostaglandin|lutalyse|estrumate|hcg|chorulon|deslorelin|sucromate|progesterone|p4)\b/.test(lower)) category = 'drug';
+
+    // Named drug, if any, so "gave Regumate" reads back as "Administered Regumate".
+    const DRUGS = ['regumate', 'altrenogest', 'oxytocin', 'prostaglandin', 'lutalyse', 'estrumate', 'hcg', 'chorulon', 'deslorelin', 'sucromate', 'progesterone'];
+    const drugRaw = DRUGS.find(d => lower.includes(d));
+    const drugName = drugRaw ? drugRaw.charAt(0).toUpperCase() + drugRaw.slice(1) : null;
+
+    // A specific check/task named in the message.
+    const checkTask =
+      /heart ?beat/.test(lower) ? 'Heartbeat check' :
+      /ultra ?sound|\bscan\b/.test(lower) ? 'Ultrasound check' :
+      /pregnan|preg ?check/.test(lower) ? 'Pregnancy check' :
+      /teased|teaser/.test(lower) ? 'Teased' :
+      /\bcheck\b/.test(lower) ? 'Check' : null;
+
+    // The most recent breeding date on record for this mare. A "day N" reminder
+    // is counted from when she was bred, not from today.
+    const breedAnchor = () => {
+      if (category === 'breed' && explicitDate) return explicitDate;
+      if (!horse) return null;
+      const bred = events
+        .filter(e => e.horseId === horse.id && (e.type === 'breed' || e.type === 'breeding' || /bred|inseminat/i.test(e.title || '')))
+        .sort((a, b) => parseLocalDate(b.date) - parseLocalDate(a.date));
+      return bred.length ? bred[0].date : null;
+    };
+
+    // Did the message describe something that already happened?
+    const takenVerb = /\b(bred|inseminat|covered|teased|administered|gave|injected|dosed|checked|performed|short[\s-]?cycled|did|done)\b/.test(lower);
+    // Does it describe something to do later?
+    const scheduleSignal = dayNumber !== null || daysOffset > 0
+      || /\b(remind|reminder|schedule|scheduled|due|need to|needs to|will need|follow ?up|recheck|re-check|book)\b/.test(lower);
+
+    // --- Action taken (becomes a logged event when it has a date) ---
+    let actionTaken = '';
+    if (takenVerb) {
+      if (category === 'breed') actionTaken = /inseminat/.test(lower) ? 'Inseminated' : 'Bred';
+      else if (category === 'short-cycle') actionTaken = 'Short cycled';
+      else if (category === 'drug') actionTaken = drugName ? `Administered ${drugName}` : 'Administered drug';
+      else actionTaken = checkTask || 'Check';
+    }
+    // If nothing was scheduled and we couldn't spot a past-tense verb, treat the
+    // message as a logged note so the user still gets an event to keep or edit.
+    if (!actionTaken && !scheduleSignal) {
+      actionTaken = checkTask || (category === 'breed' ? 'Bred' : category === 'short-cycle' ? 'Short cycled' : category === 'drug' ? (drugName ? `Administered ${drugName}` : 'Administered drug') : 'Note');
+    }
+    const actionTakenDate = actionTaken ? (explicitDate || today()) : '';
+
+    // --- Action item (becomes a scheduled reminder) ---
+    let actionItem = '';
+    let dueDate = '';
+    if (scheduleSignal) {
+      if (checkTask) {
+        actionItem = checkTask;
+      } else if (category === 'breed') {
+        actionItem = takenVerb ? `Check ${mareLabel} for pregnancy` : `Breed ${mareLabel}`;
+      } else if (category === 'drug') {
+        actionItem = drugName ? `Administer ${drugName}` : 'Administer drug';
+      } else if (category === 'short-cycle') {
+        actionItem = `Short cycle ${mareLabel}`;
+      } else {
+        actionItem = 'Reminder';
+      }
+      if (dayNumber !== null && !/\(day \d+\)/.test(actionItem)) actionItem += ` (day ${dayNumber})`;
+
+      if (dayNumber !== null) {
+        dueDate = formatDate(addDays(parseLocalDate(breedAnchor() || actionTakenDate || today()), dayNumber));
+      } else if (daysOffset > 0) {
+        dueDate = formatDate(addDays(new Date(), daysOffset));
+      } else {
+        dueDate = explicitDate && !takenVerb ? explicitDate : today();
+      }
     }
 
     return {
       horseId: horse?.id || null,
       horseName: horse?.barnName || 'Unknown',
-      actionType,
-      title,
-      detail,
-      date: dueDate,
-      actionCategory,
+      category,
+      actionTaken,
+      actionTakenDate,
+      actionItem,
+      dueDate,
+      note: text,
     };
   };
 
@@ -746,9 +873,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     setInput('');
     
     if (chatMode === 'log') {
-      // Log action mode
-      const parsed = parseInput(userMessage);
-      
+      // Log action mode. If the new message doesn't name a horse, reuse the one
+      // the conversation was already about so follow-ups like "remind at day 28"
+      // still attach to the right mare.
+      const lastHorseId = [...messages].reverse().find(m => m.confirmData?.horseId)?.confirmData.horseId;
+      const fallbackHorse = horses.find(h => h.id === lastHorseId) || null;
+      const parsed = { ...parseInput(userMessage, fallbackHorse), id: `c${Date.now()}` };
+
       setMessages([
         ...messages,
         { 
@@ -758,7 +889,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
         },
         { 
           role: 'assistant', 
-          text: `I understood: logging this event for ${parsed.horseName}`, 
+          text: `Here's what I understood for ${parsed.horseName}. Review or edit, then save.`,
           action: 'confirm',
           confirmData: parsed,
           timestamp: new Date(),
@@ -794,26 +925,52 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
   };
 
   const handleSaveConfirmation = (confirmData) => {
+    const created = [];
     if (confirmData.horseId) {
-      onAddEvent({
-        id: `e${Date.now()}`,
-        horseId: confirmData.horseId,
-        date: confirmData.date,
-        type: confirmData.actionType,
-        title: confirmData.title,
-        detail: confirmData.detail,
-      });
+      // An action taken with a date is recorded as a logged event on the horse's
+      // timeline. With no action-taken text (or no date) nothing is logged.
+      if (confirmData.actionTaken && confirmData.actionTakenDate) {
+        onAddEvent({
+          id: `e${Date.now()}`,
+          horseId: confirmData.horseId,
+          date: confirmData.actionTakenDate,
+          type: confirmData.category,
+          title: confirmData.actionTaken,
+          detail: confirmData.note || '',
+        });
+        created.push('event');
+      }
+      // An action item becomes a scheduled reminder, so it surfaces on the horse
+      // profile, the home reminders list, and the calendar on its due date.
+      if (confirmData.actionItem) {
+        onAddAction({
+          id: `a${Date.now() + 1}`,
+          horseId: confirmData.horseId,
+          category: confirmData.category,
+          title: confirmData.actionItem,
+          note: confirmData.note || '',
+          dueDate: confirmData.dueDate || today(),
+          done: false,
+        });
+        created.push('action item');
+      }
     }
 
-    // Remove the confirmation message and add success message
-    const updatedMessages = messages.filter(m => m.confirmData?.title !== confirmData.title);
+    // Remove the confirmation message and add a success (or "nothing to save") note.
+    const summary = !confirmData.horseId
+      ? `⚠️ Pick a horse first — nothing was saved.`
+      : created.length === 0
+        ? `⚠️ Nothing to save — add an action taken or an action item.`
+        : `✅ Saved ${created.join(' and ')} for ${confirmData.horseName}.`;
+
+    const updatedMessages = messages.filter(m => m.confirmData?.id !== confirmData.id);
     setMessages([
       ...updatedMessages,
       {
         role: 'assistant',
-        text: `✅ Logged! "${confirmData.title}" for ${confirmData.horseName}`,
+        text: summary,
         timestamp: new Date(),
-        success: true,
+        success: created.length > 0,
       },
     ]);
   };
@@ -821,8 +978,8 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
   const handleSaveEdit = () => {
     if (editingConfirmation) {
       // Update the confirmation message with edited data
-      const updatedMessages = messages.map(m => 
-        m.confirmData?.title === editingConfirmation.title 
+      const updatedMessages = messages.map(m =>
+        m.confirmData?.id === editingConfirmation.id
           ? { ...m, confirmData: editingConfirmation }
           : m
       );
@@ -957,13 +1114,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                       padding: DS.spacing.lg,
                       marginBottom: DS.spacing.md,
                     }}>
-                      {/* Action Category Badge */}
+                      {/* Category Badge */}
                       <div style={{ marginBottom: DS.spacing.lg }}>
-                        <div 
+                        <div
                           style={{
                             display: 'inline-block',
                             padding: `${DS.spacing.xs} ${DS.spacing.md}`,
-                            background: msg.confirmData.actionCategory === 'taken' ? DS.colors.success : DS.colors.gold,
+                            background: DS.colors.primary,
                             color: 'white',
                             borderRadius: DS.radius.full,
                             fontSize: DS.typography.size.xs,
@@ -972,33 +1129,52 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                             letterSpacing: '0.05em',
                           }}
                         >
-                          {msg.confirmData.actionCategory === 'taken' ? '✓ Action Taken' : '→ Upcoming Action'}
+                          {categoryLabel(msg.confirmData.category)}
                         </div>
                       </div>
 
-                      <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={styles.label}>Horse</div>
+                      <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
+                        <div style={styles.label}>Mare</div>
                         <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.horseName}</p>
                       </div>
 
+                      {/* Action taken -> becomes a timeline event */}
                       <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={styles.label}>Event</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.title}</p>
+                        <div style={{...styles.label, color: msg.confirmData.actionTaken ? DS.colors.success : DS.colors.textMuted}}>
+                          ✓ Action Taken
+                        </div>
+                        {msg.confirmData.actionTaken ? (
+                          <>
+                            <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold}}>{msg.confirmData.actionTaken}</p>
+                            <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
+                              {msg.confirmData.actionTakenDate ? `on ${relativeDate(msg.confirmData.actionTakenDate)}` : 'No date — won’t be logged'}
+                            </p>
+                          </>
+                        ) : (
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>None</p>
+                        )}
                       </div>
 
-                      <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={styles.label}>Details</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.detail}</p>
-                      </div>
-
+                      {/* Action item -> becomes a scheduled reminder */}
                       <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
-                        <div style={styles.label}>Action</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold, color: DS.colors.primary}}>{msg.confirmData.title}</p>
+                        <div style={{...styles.label, color: msg.confirmData.actionItem ? DS.colors.gold : DS.colors.textMuted}}>
+                          → Action Item
+                        </div>
+                        {msg.confirmData.actionItem ? (
+                          <>
+                            <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold}}>{msg.confirmData.actionItem}</p>
+                            <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
+                              {msg.confirmData.dueDate ? `Due ${relativeDate(msg.confirmData.dueDate)}` : 'Due today'}
+                            </p>
+                          </>
+                        ) : (
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>None</p>
+                        )}
                       </div>
 
                       <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={styles.label}>Date</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{relativeDate(msg.confirmData.date)}</p>
+                        <div style={styles.label}>Additional Note</div>
+                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.note || '—'}</p>
                       </div>
 
                       {/* Action Buttons */}
@@ -1019,36 +1195,92 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                     </div>
 
                     {/* Edit Modal */}
-                    {editingConfirmation?.title === msg.confirmData.title && (
+                    {editingConfirmation?.id === msg.confirmData.id && (
                       <div style={{...styles.card, marginLeft: 0, marginRight: 0, marginTop: DS.spacing.md, background: DS.colors.bgAlt, border: `2px solid ${DS.colors.gold}`}}>
                         <h3 style={{...styles.h3, color: DS.colors.gold}}>Edit Action</h3>
 
                         <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Title</label>
+                          <label style={styles.label}>Horse</label>
+                          <select
+                            value={editingConfirmation.horseId || ''}
+                            onChange={(e) => {
+                              const selected = horses.find(h => h.id === e.target.value);
+                              setEditingConfirmation({
+                                ...editingConfirmation,
+                                horseId: selected ? selected.id : null,
+                                horseName: selected ? selected.barnName : 'Unknown',
+                              });
+                            }}
+                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                          >
+                            <option value="">Unknown</option>
+                            {horses.map(h => (
+                              <option key={h.id} value={h.id}>{h.barnName}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Category</label>
+                          <select
+                            value={editingConfirmation.category}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, category: e.target.value})}
+                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                          >
+                            {ACTION_CATEGORIES.map(c => (
+                              <option key={c.key} value={c.key}>{c.label}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Action Taken</label>
                           <input
                             type="text"
-                            value={editingConfirmation.title}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, title: e.target.value})}
+                            value={editingConfirmation.actionTaken}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTaken: e.target.value})}
+                            placeholder="Leave blank if nothing was done"
                             style={{...styles.input, marginTop: DS.spacing.sm}}
                           />
                         </div>
 
                         <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Details</label>
-                          <textarea
-                            value={editingConfirmation.detail}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, detail: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '80px', fontFamily: DS.typography.family.base}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Date</label>
+                          <label style={styles.label}>Date Taken</label>
                           <input
                             type="date"
-                            value={editingConfirmation.date}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, date: e.target.value})}
+                            value={editingConfirmation.actionTakenDate}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTakenDate: e.target.value})}
                             style={{...styles.input, marginTop: DS.spacing.sm}}
+                          />
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Action Item</label>
+                          <input
+                            type="text"
+                            value={editingConfirmation.actionItem}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionItem: e.target.value})}
+                            placeholder="Leave blank for no reminder"
+                            style={{...styles.input, marginTop: DS.spacing.sm}}
+                          />
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Due Date</label>
+                          <input
+                            type="date"
+                            value={editingConfirmation.dueDate}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, dueDate: e.target.value})}
+                            style={{...styles.input, marginTop: DS.spacing.sm}}
+                          />
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Additional Note</label>
+                          <textarea
+                            value={editingConfirmation.note}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, note: e.target.value})}
+                            style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '80px', fontFamily: DS.typography.family.base}}
                           />
                         </div>
 
@@ -1059,7 +1291,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                       </div>
                     )}
                   </div>
-                )}}
+                )}
 
                 {/* Success message */}
                 {msg.role === 'assistant' && msg.success && (
@@ -1114,7 +1346,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                 handleSend();
               }
             }}
-            placeholder="What happened? (e.g., 'Roma teased, ready to breed')"
+            placeholder="What happened? (e.g., 'Bred Roma to Vitalis on May 28th, check pregnancy at day 28')"
             style={{...styles.input, flex: 1, minHeight: '44px', maxHeight: '100px', resize: 'none', borderColor: input ? DS.colors.primary : DS.colors.border}}
           />
           <button onClick={handleSend} style={{...styles.buttonBase, ...styles.buttonPrimary, width: '44px', height: '44px', padding: 0, minWidth: 'auto', flexShrink: 0}}>
@@ -1320,8 +1552,8 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
                           <div style={{ fontSize: DS.typography.size.lg, fontWeight: DS.typography.weight.bold, color: daysUntil <= 30 ? DS.colors.error : DS.colors.primary }}>
                             {daysUntil > 0 ? `${daysUntil}d` : 'Due!'}
                           </div>
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>Due: {new Date(horse.foalDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</p>
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>Conceived: {new Date(horse.conceptionDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</p>
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>Due: {parseLocalDate(horse.foalDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</p>
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>Conceived: {parseLocalDate(horse.conceptionDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</p>
                         </div>
                       </div>
                       
@@ -1344,10 +1576,10 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
                         </div>
                         <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: DS.spacing.sm }}>
                           <p style={{...styles.bodySmall, fontSize: DS.typography.size.xs}}>
-                            {new Date(horse.conceptionDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                            {parseLocalDate(horse.conceptionDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
                           </p>
                           <p style={{...styles.bodySmall, fontSize: DS.typography.size.xs}}>
-                            {new Date(horse.foalDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                            {parseLocalDate(horse.foalDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
                           </p>
                         </div>
                       </div>
@@ -1416,7 +1648,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
 // CALENDAR SCREEN
 // ============================================================================
 
-function CalendarScreen({ actions, horses }) {
+function CalendarScreen({ actions, events = [], horses }) {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [viewMode, setViewMode] = useState('month');
   const [selectedEvent, setSelectedEvent] = useState(null);
@@ -1488,6 +1720,13 @@ function CalendarScreen({ actions, horses }) {
     return actions.filter(a => a.dueDate === dateStr && !a.done);
   };
 
+  // Action-taken events live on a horse's timeline under `date`. They are shown
+  // on the calendar alongside reminders, but as colored dots rather than boxes.
+  const getEventsForDate = (date) => {
+    const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    return events.filter(e => e.date === dateStr);
+  };
+
   const getActionsForDay = (date) => {
     return getActionsForDate(date);
   };
@@ -1544,15 +1783,23 @@ function CalendarScreen({ actions, horses }) {
               </div>
 
               <div style={{ marginTop: DS.spacing.xl }}>
-                {getActionsForDay(currentDate).length === 0 ? (
+                {getActionsForDay(currentDate).length === 0 && getEventsForDate(currentDate).length === 0 ? (
                   <p style={{...styles.bodySmall, textAlign: 'center', padding: DS.spacing.lg}}>No actions scheduled for this day</p>
                 ) : (
-                  getActionsForDay(currentDate).map(action => (
-                    <div key={action.id} onClick={() => setSelectedEvent(action)} style={{...styles.card, marginLeft: 0, marginRight: 0, marginBottom: DS.spacing.md, cursor: 'pointer', transition: 'all 0.2s ease'}} onMouseEnter={(e) => e.currentTarget.style.boxShadow = DS.shadow.md} onMouseLeave={(e) => e.currentTarget.style.boxShadow = DS.shadow.xs}>
-                      <h3 style={styles.h3}>{getActionTitleWithMareName(action, horses)}</h3>
-                      {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{action.note}</p>}
-                    </div>
-                  ))
+                  <>
+                    {getActionsForDay(currentDate).map(action => (
+                      <div key={action.id} onClick={() => setSelectedEvent(action)} style={{...styles.card, marginLeft: 0, marginRight: 0, marginBottom: DS.spacing.md, cursor: 'pointer', transition: 'all 0.2s ease'}} onMouseEnter={(e) => e.currentTarget.style.boxShadow = DS.shadow.md} onMouseLeave={(e) => e.currentTarget.style.boxShadow = DS.shadow.xs}>
+                        <h3 style={styles.h3}>{getActionTitleWithMareName(action, horses)}</h3>
+                        {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{action.note}</p>}
+                      </div>
+                    ))}
+                    {getEventsForDate(currentDate).map(event => (
+                      <div key={event.id} onClick={() => setSelectedEvent(event)} style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, padding: `${DS.spacing.sm} 0`, cursor: 'pointer' }}>
+                        <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: getEventColor(event), flexShrink: 0 }} />
+                        <h3 style={{...styles.h3, margin: 0, color: DS.colors.text}}>{getActionTitleWithMareName(event, horses)}</h3>
+                      </div>
+                    ))}
+                  </>
                 )}
               </div>
             </div>
@@ -1577,8 +1824,9 @@ function CalendarScreen({ actions, horses }) {
               <div style={{ display: 'flex', flexDirection: 'column', gap: DS.spacing.md }}>
                 {weekDays.map((day, idx) => {
                   const dayActions = getActionsForDate(day);
+                  const dayEvents = getEventsForDate(day);
                   const isToday = day.toDateString() === new Date().toDateString();
-                  
+
                   return (
                     <div
                       key={idx}
@@ -1598,14 +1846,14 @@ function CalendarScreen({ actions, horses }) {
                             {day.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
                           </div>
                         </div>
-                        {dayActions.length > 0 && (
+                        {(dayActions.length + dayEvents.length) > 0 && (
                           <div style={{...styles.label, color: DS.colors.primary}}>
-                            {dayActions.length} action{dayActions.length !== 1 ? 's' : ''}
+                            {dayActions.length + dayEvents.length} item{(dayActions.length + dayEvents.length) !== 1 ? 's' : ''}
                           </div>
                         )}
                       </div>
 
-                      {dayActions.length === 0 ? (
+                      {dayActions.length === 0 && dayEvents.length === 0 ? (
                         <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>No actions</p>
                       ) : (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: DS.spacing.sm }}>
@@ -1638,6 +1886,18 @@ function CalendarScreen({ actions, horses }) {
                               <p style={{...styles.bodySmall, color: 'rgba(255,255,255,0.9)', margin: 0}}>
                                 {action.note || 'No details'}
                               </p>
+                            </div>
+                          ))}
+                          {dayEvents.map(event => (
+                            <div
+                              key={event.id}
+                              onClick={() => setSelectedEvent(event)}
+                              style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, padding: `${DS.spacing.xs} 0`, cursor: 'pointer' }}
+                            >
+                              <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: getEventColor(event), flexShrink: 0 }} />
+                              <span style={{...styles.body, color: DS.colors.text}}>
+                                {getActionTitleWithMareName(event, horses)}
+                              </span>
                             </div>
                           ))}
                         </div>
@@ -1675,6 +1935,7 @@ function CalendarScreen({ actions, horses }) {
                   const isToday = isCurrentMonth && day === getTodayNum();
                   const dayDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), day);
                   const dayActions = day ? getActionsForDate(dayDate) : [];
+                  const dayEvents = day ? getEventsForDate(dayDate) : [];
                   
                   return (
                     <div
@@ -1720,6 +1981,32 @@ function CalendarScreen({ actions, horses }) {
                                 {getActionTitleWithMareName(action, horses)}
                               </div>
                             ))}
+                            {dayEvents.map(event => (
+                              <div
+                                key={event.id}
+                                onClick={() => setSelectedEvent(event)}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: DS.spacing.xs,
+                                  color: DS.colors.text,
+                                  fontSize: DS.typography.size.xs,
+                                  marginBottom: DS.spacing.xs,
+                                  height: '20px',
+                                  lineHeight: '20px',
+                                  cursor: 'pointer',
+                                  transition: 'all 0.2s ease',
+                                }}
+                                title={getActionTitleWithMareName(event, horses)}
+                                onMouseEnter={(e) => e.currentTarget.style.opacity = '0.7'}
+                                onMouseLeave={(e) => e.currentTarget.style.opacity = '1'}
+                              >
+                                <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: getEventColor(event), flexShrink: 0 }} />
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {getActionTitleWithMareName(event, horses)}
+                                </span>
+                              </div>
+                            ))}
                           </div>
                         </>
                       )}
@@ -1734,7 +2021,9 @@ function CalendarScreen({ actions, horses }) {
           {selectedEvent && (
             <div style={{...styles.card, marginLeft: 0, marginRight: 0, marginTop: DS.spacing.xl, background: DS.colors.bgAlt, border: `2px solid ${DS.colors.primary}`}}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: DS.spacing.lg }}>
-                <h2 style={{...styles.h2, margin: 0, color: DS.colors.primary}}>Action Details</h2>
+                <h2 style={{...styles.h2, margin: 0, color: DS.colors.primary}}>
+                  {selectedEvent.dueDate ? 'Action Item' : 'Action Taken'}
+                </h2>
                 <button onClick={() => setSelectedEvent(null)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '24px', color: DS.colors.text }}>
                   ✕
                 </button>
@@ -1748,24 +2037,26 @@ function CalendarScreen({ actions, horses }) {
                   </h3>
                 </div>
 
-                {selectedEvent.note && (
+                {(selectedEvent.note || selectedEvent.detail) && (
                   <div style={{ marginBottom: DS.spacing.md }}>
                     <div style={styles.label}>Details</div>
-                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{selectedEvent.note}</p>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{selectedEvent.note || selectedEvent.detail}</p>
                   </div>
                 )}
 
-                <div style={{ marginBottom: DS.spacing.md }}>
-                  <div style={styles.label}>Due Date</div>
-                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{relativeDate(selectedEvent.dueDate)}</p>
+                <div style={{ marginBottom: (selectedEvent.dueDate && selectedEvent.priority) ? DS.spacing.md : 0 }}>
+                  <div style={styles.label}>{selectedEvent.dueDate ? 'Due Date' : 'Date Taken'}</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{relativeDate(selectedEvent.dueDate || selectedEvent.date)}</p>
                 </div>
 
-                <div>
-                  <div style={styles.label}>Priority</div>
-                  <p style={{...styles.body, marginTop: DS.spacing.sm, textTransform: 'capitalize', color: selectedEvent.priority === 'high' ? DS.colors.error : selectedEvent.priority === 'medium' ? DS.colors.gold : DS.colors.success}}>
-                    {selectedEvent.priority}
-                  </p>
-                </div>
+                {selectedEvent.dueDate && selectedEvent.priority && (
+                  <div>
+                    <div style={styles.label}>Priority</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm, textTransform: 'capitalize', color: selectedEvent.priority === 'high' ? DS.colors.error : selectedEvent.priority === 'medium' ? DS.colors.gold : DS.colors.success}}>
+                      {selectedEvent.priority}
+                    </p>
+                  </div>
+                )}
               </div>
 
               <button onClick={() => setSelectedEvent(null)} style={{...styles.buttonBase, ...styles.buttonSecondary, width: '100%'}}>
@@ -2086,7 +2377,7 @@ export default function App() {
           }}
         />
       ) : activeTab === 'calendar' ? (
-        <CalendarScreen actions={actions} horses={horses} />
+        <CalendarScreen actions={actions} events={events} horses={horses} />
       ) : (
         <SettingsScreen />
       )}
