@@ -549,7 +549,7 @@ function FileViewer({ file, onClose }) {
 // HORSE DETAIL SCREEN
 // ============================================================================
 
-function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onUpdateStallion, onToggleBreedingList, onUpdateHorse, onUpdateHorseStatus, onDeleteHorse }) {
+function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onUpdateStallion, onToggleBreedingList, onUpdateHorse, onUpdateHorseStatus, onDeleteHorse, onSaveTimelineItem, onDeleteEvent, onDeleteAction }) {
   const [activeTab, setActiveTab] = useState('timeline');
   const [status, setStatus] = useState(horse.breedingStatus || '');
   const [stallion, setStallion] = useState(horse.plannedStallion || '');
@@ -563,6 +563,11 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   const [editForm, setEditForm] = useState(horse);
   const [editErrors, setEditErrors] = useState({});
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  // The timeline item (event or action) currently being edited, and its working
+  // copy. `itemForm` normalizes both record shapes onto common fields so a single
+  // editor can edit either kind — and switch between them via the type dropdown.
+  const [editingItemId, setEditingItemId] = useState(null);
+  const [itemForm, setItemForm] = useState(null);
   const fileInputRef = React.useRef(null);
 
   const horseEvents = events.filter(e => e.horseId === horse.id).sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -657,6 +662,105 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
     // gone and a stray blob is harmless.
     fetch(`/.netlify/functions/files?id=${fileId}`, { method: 'DELETE' }).catch(() => {});
   };
+
+  // Open the inline editor for a timeline item, normalizing the event/action
+  // shape onto shared fields so one form serves both. `note` doubles as an
+  // event's detail; `date` doubles as an action's due date.
+  const startEditItem = (kind, item) => {
+    setEditingItemId(item.id);
+    setItemForm(
+      kind === 'event'
+        ? { kind: 'event', id: item.id, title: item.title || '', note: item.detail || '', date: item.date || today(), category: item.type || ACTION_CATEGORIES[0].key, done: false }
+        : { kind: 'action', id: item.id, title: item.title || '', note: item.note || '', date: item.dueDate || today(), category: item.category || ACTION_CATEGORIES[0].key, done: !!item.done },
+    );
+  };
+
+  const cancelEditItem = () => {
+    setEditingItemId(null);
+    setItemForm(null);
+  };
+
+  // Save the editor, rebuilding the record into whichever shape the chosen type
+  // requires. When the type changed, the parent moves it between collections.
+  const saveEditItem = (originalKind) => {
+    if (!itemForm) return;
+    const built =
+      itemForm.kind === 'event'
+        ? { id: itemForm.id, horseId: horse.id, title: itemForm.title, detail: itemForm.note, date: itemForm.date, type: itemForm.category }
+        : { id: itemForm.id, horseId: horse.id, title: itemForm.title, note: itemForm.note, dueDate: itemForm.date, category: itemForm.category, done: itemForm.done };
+    onSaveTimelineItem(originalKind, itemForm.kind, built);
+    cancelEditItem();
+  };
+
+  // The shared edit form for a timeline item. The type dropdown lets the user
+  // turn an event into an action (and back); the date/note labels follow suit.
+  const renderItemEditor = (originalKind) => (
+    <div>
+      <label style={styles.label}>Type</label>
+      <select
+        value={itemForm.kind}
+        onChange={(e) => setItemForm({ ...itemForm, kind: e.target.value })}
+        style={{...styles.input, marginTop: DS.spacing.sm, marginBottom: DS.spacing.md, background: DS.colors.white}}
+      >
+        <option value="event">Event (something that happened)</option>
+        <option value="action">Action (a reminder / to-do)</option>
+      </select>
+
+      <label style={styles.label}>Title</label>
+      <input
+        type="text"
+        value={itemForm.title}
+        onChange={(e) => setItemForm({ ...itemForm, title: e.target.value })}
+        placeholder="Title"
+        style={{...styles.input, marginTop: DS.spacing.sm, marginBottom: DS.spacing.md}}
+      />
+
+      <label style={styles.label}>Category</label>
+      <select
+        value={itemForm.category}
+        onChange={(e) => setItemForm({ ...itemForm, category: e.target.value })}
+        style={{...styles.input, marginTop: DS.spacing.sm, marginBottom: DS.spacing.md, background: DS.colors.white}}
+      >
+        {ACTION_CATEGORIES.map(c => (
+          <option key={c.key} value={c.key}>{c.label}</option>
+        ))}
+      </select>
+
+      <label style={styles.label}>{itemForm.kind === 'event' ? 'Detail' : 'Note'}</label>
+      <input
+        type="text"
+        value={itemForm.note}
+        onChange={(e) => setItemForm({ ...itemForm, note: e.target.value })}
+        placeholder={itemForm.kind === 'event' ? 'What happened' : 'Notes'}
+        style={{...styles.input, marginTop: DS.spacing.sm, marginBottom: DS.spacing.md}}
+      />
+
+      <label style={styles.label}>{itemForm.kind === 'event' ? 'Date' : 'Due date'}</label>
+      <input
+        type="date"
+        value={itemForm.date}
+        onChange={(e) => setItemForm({ ...itemForm, date: e.target.value })}
+        style={{...styles.input, marginTop: DS.spacing.sm, marginBottom: DS.spacing.md}}
+      />
+
+      {itemForm.kind === 'action' && (
+        <label style={{...styles.label, display: 'flex', alignItems: 'center', gap: DS.spacing.md, textTransform: 'none', marginBottom: DS.spacing.md}}>
+          <input
+            type="checkbox"
+            checked={itemForm.done}
+            onChange={(e) => setItemForm({ ...itemForm, done: e.target.checked })}
+            style={{ width: '20px', height: '20px', cursor: 'pointer' }}
+          />
+          Mark as done
+        </label>
+      )}
+
+      <div style={{ display: 'flex', gap: DS.spacing.md }}>
+        <button onClick={() => saveEditItem(originalKind)} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
+        <button onClick={cancelEditItem} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
+      </div>
+    </div>
+  );
 
   const headerActions = (
     <div style={{ display: 'flex', gap: DS.spacing.sm }}>
@@ -888,9 +992,31 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               ) : (
                 horseEvents.map(event => (
                   <div key={event.id} style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-                    <h3 style={styles.h3}>{event.title}</h3>
-                    <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{event.detail}</p>
-                    <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>{relativeDate(event.date)}</p>
+                    {editingItemId === event.id ? renderItemEditor('event') : (
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
+                        <div style={{ flex: 1 }}>
+                          <h3 style={styles.h3}>{event.title}</h3>
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{event.detail}</p>
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>{relativeDate(event.date)}</p>
+                        </div>
+                        <div style={{ display: 'flex', gap: DS.spacing.sm, flexShrink: 0 }}>
+                          <button
+                            onClick={() => startEditItem('event', event)}
+                            style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
+                            title="Edit"
+                          >
+                            <Edit2 size={18} />
+                          </button>
+                          <button
+                            onClick={() => onDeleteEvent(event.id)}
+                            style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
+                            title="Delete"
+                          >
+                            <Trash2 size={18} />
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))
               )}
@@ -903,14 +1029,29 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               ) : (
                 horseActions.map(action => (
                   <div key={action.id} style={{...styles.card, marginLeft: 0, marginRight: 0, opacity: action.done ? 0.6 : 1, background: action.done ? DS.colors.bgAlt : DS.colors.white}}>
+                    {editingItemId === action.id ? renderItemEditor('action') : (
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
                       <div style={{ flex: 1 }}>
                         <h3 style={{...styles.h3, textDecoration: action.done ? 'line-through' : 'none'}}>{action.title}</h3>
                         {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{action.note}</p>}
                         <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>Due: {relativeDate(action.dueDate)}</p>
                       </div>
-                      {action.done && (
-                        <div style={{ flexShrink: 0, marginTop: '2px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, flexShrink: 0 }}>
+                        <button
+                          onClick={() => startEditItem('action', action)}
+                          style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
+                          title="Edit"
+                        >
+                          <Edit2 size={18} />
+                        </button>
+                        <button
+                          onClick={() => onDeleteAction(action.id)}
+                          style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
+                          title="Delete"
+                        >
+                          <Trash2 size={18} />
+                        </button>
+                        {action.done && (
                           <div style={{
                             width: '32px',
                             height: '32px',
@@ -925,9 +1066,10 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                           }}>
                             ✓
                           </div>
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </div>
+                    )}
                   </div>
                 ))
               )}
@@ -3021,6 +3163,48 @@ export default function App() {
     flash('Action updated');
   };
 
+  const handleDeleteEvent = (eventId) => {
+    setEvents(events.filter(e => e.id !== eventId));
+    removeItem('events', eventId);
+    flash('Event deleted');
+  };
+
+  // Save an edited timeline item, handling the case where the user changed what
+  // it is (event <-> action) via the editor's type dropdown. When the kind is
+  // unchanged the record is updated in place. When it changed, the record is
+  // removed from its old collection and written to the new one (events and
+  // actions are stored separately), so the item moves cleanly between the two.
+  const handleSaveTimelineItem = (originalKind, kind, item) => {
+    if (originalKind === kind) {
+      if (kind === 'event') {
+        setEvents(events.map(e => e.id === item.id ? item : e));
+        persistItem('events', item);
+      } else {
+        setActions(actions.map(a => a.id === item.id ? item : a));
+        persistItem('actions', item);
+      }
+      flash(kind === 'event' ? 'Event updated' : 'Action updated');
+      return;
+    }
+
+    if (originalKind === 'event') {
+      setEvents(events.filter(e => e.id !== item.id));
+      removeItem('events', item.id);
+    } else {
+      setActions(actions.filter(a => a.id !== item.id));
+      removeItem('actions', item.id);
+    }
+
+    if (kind === 'event') {
+      setEvents(prev => [...prev, item]);
+      persistItem('events', item);
+    } else {
+      setActions(prev => [...prev, item]);
+      persistItem('actions', item);
+    }
+    flash(kind === 'event' ? 'Changed to event' : 'Changed to action');
+  };
+
   const selectedHorseData = horses.find(h => h.id === selectedHorse);
 
   return (
@@ -3048,6 +3232,9 @@ export default function App() {
           onUpdateHorse={handleUpdateHorse}
           onUpdateHorseStatus={handleUpdateHorseStatus}
           onDeleteHorse={handleDeleteHorse}
+          onSaveTimelineItem={handleSaveTimelineItem}
+          onDeleteEvent={handleDeleteEvent}
+          onDeleteAction={handleDeleteAction}
         />
       ) : activeTab === 'home' ? (
         <HomeScreen
