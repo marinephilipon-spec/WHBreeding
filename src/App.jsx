@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Home, Calendar as CalIcon, Heart, MessageSquare, Settings,
   ChevronRight, ChevronLeft, Plus, Sparkles, Check, X,
@@ -217,10 +217,34 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                 <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.color}</p>
               </div>
               <div>
-                <div style={styles.label}>Born</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.yob}</p>
+                <div style={styles.label}>{horse.dateOfBirth ? 'Date of Birth' : 'Born'}</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dateOfBirth ? new Date(horse.dateOfBirth).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
               </div>
+              {horse.owner && (
+                <div>
+                  <div style={styles.label}>Owner</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.owner}</p>
+                </div>
+              )}
+              {horse.discipline && (
+                <div>
+                  <div style={styles.label}>Discipline</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.discipline}</p>
+                </div>
+              )}
+              {horse.size && (
+                <div>
+                  <div style={styles.label}>Size</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.size}</p>
+                </div>
+              )}
             </div>
+            {horse.additionalInfo && (
+              <div style={{ paddingTop: DS.spacing.md, borderTop: `1px solid ${DS.colors.border}` }}>
+                <div style={styles.label}>Additional Information</div>
+                <p style={{...styles.body, marginTop: DS.spacing.sm, whiteSpace: 'pre-wrap'}}>{horse.additionalInfo}</p>
+              </div>
+            )}
           </div>
 
           {/* Breeding Management */}
@@ -375,9 +399,13 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                   <div style={styles.label}>Sire</div>
                   <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.sire}</p>
                 </div>
-                <div>
+                <div style={{ marginBottom: DS.spacing.lg }}>
                   <div style={styles.label}>Dam</div>
                   <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dam}</p>
+                </div>
+                <div>
+                  <div style={styles.label}>Dam-Sire (maternal grandsire)</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.damSire || 'Unknown'}</p>
                 </div>
               </div>
             </>
@@ -1105,7 +1133,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [filterType, setFilterType] = useState('all');
-  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+  const emptyForm = {
+    barnName: '', nickname: '', breed: '', type: 'mare',
+    dateOfBirth: '', color: '', owner: '',
+    sire: '', dam: '', damSire: '',
+    discipline: '', size: '', additionalInfo: '',
+  };
+  const [formData, setFormData] = useState(emptyForm);
   const [showBornModal, setShowBornModal] = useState(false);
   const [selectedBornHorse, setSelectedBornHorse] = useState(null);
   const [foalForm, setFoalForm] = useState({ name: '', gender: 'filly' });
@@ -1113,7 +1147,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const handleAdd = () => {
     if (formData.barnName && formData.breed) {
       onAddHorse(formData);
-      setFormData({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+      setFormData(emptyForm);
       setShowAddForm(false);
     }
   };
@@ -1191,6 +1225,42 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
               <div style={{ marginTop: DS.spacing.lg }}>
                 <label style={styles.label}>Breed</label>
                 <input type="text" value={formData.breed} onChange={(e) => setFormData({...formData, breed: e.target.value})} placeholder="e.g., KWPN" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Date of Birth</label>
+                <input type="date" value={formData.dateOfBirth} onChange={(e) => setFormData({...formData, dateOfBirth: e.target.value})} style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Color</label>
+                <input type="text" value={formData.color} onChange={(e) => setFormData({...formData, color: e.target.value})} placeholder="e.g., Bay" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Owner</label>
+                <input type="text" value={formData.owner} onChange={(e) => setFormData({...formData, owner: e.target.value})} placeholder="e.g., Jane Smith" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Sire (father)</label>
+                <input type="text" value={formData.sire} onChange={(e) => setFormData({...formData, sire: e.target.value})} placeholder="e.g., Vitalis" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam (mother)</label>
+                <input type="text" value={formData.dam} onChange={(e) => setFormData({...formData, dam: e.target.value})} placeholder="e.g., Roma" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam-Sire (maternal grandsire)</label>
+                <input type="text" value={formData.damSire} onChange={(e) => setFormData({...formData, damSire: e.target.value})} placeholder="e.g., Negro" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Discipline</label>
+                <input type="text" value={formData.discipline} onChange={(e) => setFormData({...formData, discipline: e.target.value})} placeholder="e.g., Dressage, Jumping" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Size</label>
+                <input type="text" value={formData.size} onChange={(e) => setFormData({...formData, size: e.target.value})} placeholder="e.g., 16.2 hands" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Additional Information</label>
+                <textarea value={formData.additionalInfo} onChange={(e) => setFormData({...formData, additionalInfo: e.target.value})} placeholder="Anything else worth recording…" rows={4} style={{...styles.input, marginTop: DS.spacing.sm, resize: 'vertical', minHeight: '88px'}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleAdd} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
@@ -1806,20 +1876,62 @@ export default function App() {
   const [selectedHorse, setSelectedHorse] = useState(null);
   const [toast, setToast] = useState('');
 
+  // Load all previously saved data once on startup so records survive refreshes.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/.netlify/functions/store')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        if (Array.isArray(data.horses)) setHorses(data.horses);
+        if (Array.isArray(data.actions)) setActions(data.actions);
+        if (Array.isArray(data.events)) setEvents(data.events);
+      })
+      .catch((err) => console.error('Failed to load saved data:', err));
+    return () => { cancelled = true; };
+  }, []);
+
+  // Save (insert or update) a single record. Fire-and-forget: the UI updates
+  // immediately and the write happens in the background.
+  const persistItem = (collection, item) => {
+    fetch('/.netlify/functions/store', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collection, item }),
+    }).catch((err) => console.error(`Failed to save ${collection}:`, err));
+  };
+
+  const removeItem = (collection, id) => {
+    fetch('/.netlify/functions/store', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collection, id }),
+    }).catch((err) => console.error(`Failed to delete ${collection}:`, err));
+  };
+
   const flash = (msg) => {
     setToast(msg);
     setTimeout(() => setToast(''), 2000);
   };
 
   const handleAddHorse = (formData) => {
+    const yob = formData.yob
+      || (formData.dateOfBirth ? new Date(formData.dateOfBirth).getFullYear() : new Date().getFullYear());
     const newHorse = {
       id: `h${Date.now()}`,
       ...formData,
+      yob,
       name: formData.name || formData.barnName,
       nickname: formData.nickname || formData.barnName,
+      dateOfBirth: formData.dateOfBirth || '',
       color: formData.color || 'Bay',
+      owner: formData.owner || '',
       sire: formData.sire || 'Unknown',
       dam: formData.dam || 'Unknown',
+      damSire: formData.damSire || '',
+      discipline: formData.discipline || '',
+      size: formData.size || '',
+      additionalInfo: formData.additionalInfo || '',
       breedingStatus: formData.type === 'mare' ? 'Waiting for cycle' : null,
       plannedStallion: null,
       expectedFoalColor: null,
@@ -1829,6 +1941,7 @@ export default function App() {
       files: [],
     };
     setHorses([...horses, newHorse]);
+    persistItem('horses', newHorse);
     flash(`${newHorse.barnName} added!`);
   };
 
@@ -1836,37 +1949,51 @@ export default function App() {
     setSelectedHorse(horseId);
   };
 
+  // Applies a change to one horse, updates state, and persists the new record.
+  const updateHorse = (horseId, changes) => {
+    const existing = horses.find(h => h.id === horseId);
+    if (!existing) return null;
+    const updated = { ...existing, ...changes };
+    setHorses(horses.map(h => h.id === horseId ? updated : h));
+    persistItem('horses', updated);
+    return updated;
+  };
+
   const handleUpdateStatus = (horseId, status) => {
-    setHorses(horses.map(h => h.id === horseId ? {...h, breedingStatus: status} : h));
-    const horse = horses.find(h => h.id === horseId);
-    flash(`${horse.barnName} status updated`);
+    const horse = updateHorse(horseId, { breedingStatus: status });
+    if (horse) flash(`${horse.barnName} status updated`);
   };
 
   const handleUpdateStallion = (horseId, stallion) => {
-    setHorses(horses.map(h => h.id === horseId ? {...h, plannedStallion: stallion} : h));
+    updateHorse(horseId, { plannedStallion: stallion });
   };
 
   const handleToggleBreedingList = (horseId, onList) => {
-    setHorses(horses.map(h => h.id === horseId ? {...h, onBreedingList: onList} : h));
-    const horse = horses.find(h => h.id === horseId);
-    flash(onList ? `${horse.barnName} added to breeding list` : `${horse.barnName} removed from breeding list`);
+    const horse = updateHorse(horseId, { onBreedingList: onList });
+    if (horse) flash(onList ? `${horse.barnName} added to breeding list` : `${horse.barnName} removed from breeding list`);
   };
 
   const handleUpdateHorse = (horseId, updatedData) => {
-    setHorses(horses.map(h => h.id === horseId ? {...h, ...updatedData} : h));
+    updateHorse(horseId, updatedData);
   };
 
   const handleToggleAction = (actionId) => {
-    setActions(actions.map(a => a.id === actionId ? {...a, done: !a.done} : a));
+    const existing = actions.find(a => a.id === actionId);
+    if (!existing) return;
+    const updated = { ...existing, done: !existing.done };
+    setActions(actions.map(a => a.id === actionId ? updated : a));
+    persistItem('actions', updated);
   };
 
   const handleDeleteAction = (actionId) => {
     setActions(actions.filter(a => a.id !== actionId));
+    removeItem('actions', actionId);
     flash('Action deleted');
   };
 
   const handleEditAction = (actionId, updatedAction) => {
     setActions(actions.map(a => a.id === actionId ? updatedAction : a));
+    persistItem('actions', updatedAction);
     flash('Action updated');
   };
 
@@ -1916,10 +2043,12 @@ export default function App() {
           onBack={() => setActiveTab('home')}
           onAddEvent={(event) => {
             setEvents([...events, event]);
+            persistItem('events', event);
             flash(`Event logged!`);
           }}
           onAddAction={(action) => {
             setActions([...actions, action]);
+            persistItem('actions', action);
             flash(`Action added!`);
           }}
         />
