@@ -17,11 +17,15 @@ exports.handler = async (event) => {
       };
     }
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    // Route through Netlify AI Gateway. Netlify injects ANTHROPIC_BASE_URL and
+    // ANTHROPIC_API_KEY automatically, so no manual API key configuration is needed.
+    const baseUrl = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+    const response = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
