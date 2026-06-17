@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Home, Calendar as CalIcon, Heart, MessageSquare, Settings,
   ChevronRight, ChevronLeft, Plus, Sparkles, Check, X,
@@ -1806,10 +1806,56 @@ export default function App() {
   const [selectedHorse, setSelectedHorse] = useState(null);
   const [toast, setToast] = useState('');
 
+  // Tracks whether the initial state has loaded from the server, so we don't
+  // overwrite saved data with the empty starting state before it arrives.
+  const [loaded, setLoaded] = useState(false);
+  const saveTimer = useRef(null);
+
   const flash = (msg) => {
     setToast(msg);
     setTimeout(() => setToast(''), 2000);
   };
+
+  // Load persisted state once on startup.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/state');
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled) {
+            if (Array.isArray(data.horses)) setHorses(data.horses);
+            if (Array.isArray(data.actions)) setActions(data.actions);
+            if (Array.isArray(data.events)) setEvents(data.events);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load saved data:', err);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist state whenever horses, actions, or events change (debounced).
+  useEffect(() => {
+    if (!loaded) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      fetch('/api/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ horses, actions, events }),
+      }).catch((err) => console.error('Failed to save data:', err));
+    }, 600);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [horses, actions, events, loaded]);
 
   const handleAddHorse = (formData) => {
     const newHorse = {
