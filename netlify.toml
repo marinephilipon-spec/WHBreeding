@@ -3,6 +3,17 @@
   publish = "dist"
   functions = "netlify/functions"
 
+# Bundle functions with esbuild (single self-contained file) instead of the
+# default file-tracing bundler. The store function imports
+# `drizzle-orm/netlify-db`, whose package exports map resolves to `index.cjs`
+# under the `require` condition at runtime — but the tracing bundler only ships
+# the ESM `index.js`, so the deployed function crashed on load with
+# "Cannot find module .../drizzle-orm/netlify-db/index.cjs" and every save/load
+# request returned a 502. esbuild inlines the whole dependency tree, so there is
+# no runtime module resolution to get wrong.
+[functions]
+  node_bundler = "esbuild"
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
