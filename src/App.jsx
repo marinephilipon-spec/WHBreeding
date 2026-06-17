@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   Home, Calendar as CalIcon, Heart, MessageSquare, Settings,
-  ChevronRight, ChevronLeft, Plus, Sparkles, Check, X,
+  ChevronRight, ChevronLeft, ChevronDown, Plus, Sparkles, Check, X,
   Trash2, Edit2, FileText,
 } from 'lucide-react';
 
@@ -65,6 +65,20 @@ const ACTION_CATEGORIES = [
 ];
 const categoryLabel = (key) =>
   (ACTION_CATEGORIES.find(c => c.key === key) || ACTION_CATEGORIES[0]).label;
+
+// Small pill used in the chat confirmation card to tag a section's category.
+const categoryChip = {
+  display: 'inline-block',
+  padding: '2px 10px',
+  background: '#EFEAE3',
+  color: '#6B5B4D',
+  borderRadius: '999px',
+  fontSize: '11px',
+  fontWeight: 600,
+  textTransform: 'uppercase',
+  letterSpacing: '0.04em',
+  whiteSpace: 'nowrap',
+};
 
 // Parse a date value into a Date in the LOCAL timezone. A bare "YYYY-MM-DD"
 // string is otherwise parsed by the Date constructor as UTC midnight, which
@@ -141,6 +155,62 @@ const parseExplicitDate = (text) => {
   return null;
 };
 
+// Day-of-week names (plus common short forms) mapped to their getDay() index.
+const WEEKDAYS = {
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
+  sun: 0, mon: 1, tue: 2, tues: 2, wed: 3, weds: 3, thu: 4, thur: 4, thurs: 4, fri: 5, sat: 6,
+};
+
+// Resolve a relative day reference — "today", "yesterday", "3 days ago",
+// "last week", "last Sunday", "on Tuesday" — into a local "YYYY-MM-DD" string,
+// computed against the current date. Returns null when the text names no
+// relative day. This lets the chat log events that already happened on the day
+// they actually happened ("bred her last Tuesday") instead of defaulting to
+// today. `lower` is the message already lower-cased. Only past references are
+// resolved here; future scheduling is handled separately by the day/week offset
+// logic in the message parser.
+const parseRelativeDate = (lower) => {
+  const base = new Date();
+  base.setHours(0, 0, 0, 0);
+
+  if (/\bday before yesterday\b/.test(lower)) return formatDate(addDays(base, -2));
+  if (/\b(yesterday|yday)\b/.test(lower)) return formatDate(addDays(base, -1));
+  if (/\btoday\b/.test(lower)) return formatDate(base);
+
+  // "3 days ago", "2 weeks ago", "a week ago", "last week".
+  let m = lower.match(/\b(\d+)\s*(day|days|week|weeks)\s+ago\b/);
+  if (m) {
+    const mult = /week/.test(m[2]) ? 7 : 1;
+    return formatDate(addDays(base, -parseInt(m[1], 10) * mult));
+  }
+  if (/\b(a\s+week\s+ago|last\s+week)\b/.test(lower)) return formatDate(addDays(base, -7));
+
+  // "last Sunday" / "this Monday" / "on Tuesday" / a bare weekday — interpreted
+  // as the most recent past occurrence of that weekday. A leading "next" is
+  // explicitly excluded so future references aren't pulled into the past.
+  const dayNames = Object.keys(WEEKDAYS).join('|');
+  m = lower.match(new RegExp(`\\b(next\\s+)?(?:last|this|past|on)?\\s*(${dayNames})\\b`, 'i'));
+  if (m && !m[1]) {
+    const target = WEEKDAYS[m[2].toLowerCase()];
+    let diff = base.getDay() - target;
+    if (diff <= 0) diff += 7; // strictly in the past; today's weekday means a week ago
+    return formatDate(addDays(base, -diff));
+  }
+
+  return null;
+};
+
+// The breeding-cycle statuses a mare can be in. Shared by the profile dropdown
+// and the chat, so logging "bred Bella" in the chat can move her status here.
+const BREEDING_STATUSES = [
+  'Waiting for cycle',
+  'Ready to breed',
+  'Inseminated',
+  '14-day pregnancy check',
+  'Confirmed in foal',
+  'Lost - back open',
+];
+
 const getStatusColor = (status) => ({
   'Waiting for cycle': DS.colors.status.waiting,
   'Ready to breed': DS.colors.status.ready,
@@ -149,6 +219,22 @@ const getStatusColor = (status) => ({
   'Confirmed in foal': DS.colors.status.foal,
   'Lost - back open': DS.colors.status.open,
 }[status] || DS.colors.textMuted);
+
+// Infer the breeding-cycle status a logged chat message implies, so that
+// recording what happened to a mare also moves the status badge/dropdown to
+// match. Returns '' when the message says nothing status-relevant. The negative
+// cases ("not in foal", "came back open") are checked before the positive ones
+// so "not pregnant" never reads as "pregnant".
+const inferBreedingStatus = (lower, takenCategory) => {
+  if (/\bnot\s+(?:in\s+foal|pregnant)\b|back\s+open|reabsorb|aborted|slipped|lost\s+(?:the|her)\s+(?:foal|pregnancy)/.test(lower)) {
+    return 'Lost - back open';
+  }
+  if (/confirmed\s+in\s+foal|\bin\s+foal\b|\bpregnant\b|heartbeat|positive\s+(?:preg|pregnancy)/.test(lower)) {
+    return 'Confirmed in foal';
+  }
+  if (takenCategory === 'breed') return 'Inseminated';
+  return '';
+};
 
 // A horse's lifecycle status — independent of where a mare is in her breeding
 // cycle. Used both for the dropdown in the profile and the colored badge.
@@ -737,12 +823,9 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                   style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getStatusColor(status)}`}}
                 >
                   <option value="">Select status...</option>
-                  <option value="Waiting for cycle">Waiting for cycle</option>
-                  <option value="Ready to breed">Ready to breed</option>
-                  <option value="Inseminated">Inseminated</option>
-                  <option value="14-day pregnancy check">14-day pregnancy check</option>
-                  <option value="Confirmed in foal">Confirmed in foal</option>
-                  <option value="Lost - back open">Lost - back open</option>
+                  {BREEDING_STATUSES.map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
                 </select>
               </div>
 
@@ -966,6 +1049,22 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
   const [editingAction, setEditingAction] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [actionFilter, setActionFilter] = useState('all');
+  // Which home sections are collapsed. Persisted to localStorage so the choice
+  // survives refreshes.
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('homeCollapsed') || '{}');
+    } catch {
+      return {};
+    }
+  });
+  const toggleSection = (key) => {
+    setCollapsed(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem('homeCollapsed', JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
 
   const breedingMares = horses.filter(h => h.type === 'mare' && h.onBreedingList);
   const pendingActions = actions.filter(a => !a.done);
@@ -1040,8 +1139,15 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
 
           {/* Breeding Mares */}
           <div>
-            <h2 style={styles.h2}>Your Breeding Mares</h2>
-            {breedingMares.length === 0 ? (
+            <h2
+              style={{...styles.h2, display: 'flex', alignItems: 'center', gap: DS.spacing.sm, cursor: 'pointer', userSelect: 'none'}}
+              onClick={() => toggleSection('mares')}
+            >
+              {collapsed.mares ? <ChevronRight size={22} color={DS.colors.primary} /> : <ChevronDown size={22} color={DS.colors.primary} />}
+              Your Breeding Mares
+              <span style={{...styles.bodySmall, color: DS.colors.textMuted, fontWeight: DS.typography.weight.normal}}>({breedingMares.length})</span>
+            </h2>
+            {!collapsed.mares && (breedingMares.length === 0 ? (
               <div style={{...styles.card, textAlign: 'center', marginLeft: 0, marginRight: 0}}>
                 <p style={styles.bodySmall}>No mares on breeding list</p>
               </div>
@@ -1064,13 +1170,21 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
                   </div>
                 </div>
               ))
-            )}
+            ))}
           </div>
 
           {/* Calendar - Actions */}
           <div style={{ marginTop: DS.spacing['3xl'] }}>
-            <h2 style={styles.h2}>📅 Upcoming Actions</h2>
+            <h2
+              style={{...styles.h2, display: 'flex', alignItems: 'center', gap: DS.spacing.sm, cursor: 'pointer', userSelect: 'none'}}
+              onClick={() => toggleSection('actions')}
+            >
+              {collapsed.actions ? <ChevronRight size={22} color={DS.colors.primary} /> : <ChevronDown size={22} color={DS.colors.primary} />}
+              📅 Upcoming Actions
+              <span style={{...styles.bodySmall, color: DS.colors.textMuted, fontWeight: DS.typography.weight.normal}}>({pendingActions.length})</span>
+            </h2>
 
+            {!collapsed.actions && (<>
             {/* Tabs: All / Today / This Week */}
             <div style={{ display: 'flex', gap: DS.spacing.sm, marginBottom: DS.spacing.lg, overflowX: 'auto', paddingBottom: DS.spacing.xs }}>
               {actionTabs.map(tab => (
@@ -1164,6 +1278,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
                 </div>
               ))
             )}
+            </>)}
           </div>
         </div>
       </div>
@@ -1175,7 +1290,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
 // CHAT SCREEN
 // ============================================================================
 
-function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }) {
+function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, onUpdateBreedingStatus }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [editingConfirmation, setEditingConfirmation] = useState(null);
@@ -1201,14 +1316,21 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     const mareLabel = horse?.nickname || horse?.barnName || 'the mare';
 
     // Pull timing signals out of the text.
-    const explicitDate = parseExplicitDate(text);          // "May 28th, 2026"
+    // A relative day reference ("yesterday", "last Sunday", "3 days ago") wins
+    // over an explicit calendar date; they rarely co-occur, and resolving the
+    // spoken-relative form is what lets a past event be logged on its real day.
+    const explicitDate = parseRelativeDate(lower) || parseExplicitDate(text);  // "yesterday" / "May 28th, 2026"
     const dayNumberMatch = lower.match(/\bday\s+(\d+)\b/);  // "day 28" -> day of the cycle
     const dayNumber = dayNumberMatch ? parseInt(dayNumberMatch[1], 10) : null;
-    const daysMatch = lower.match(/(\d+)\s*(?:day|days)\b/); // "in 28 days" -> from today
+    // "in 28 days" / "in 2 weeks" -> a FUTURE offset from today. A trailing
+    // "ago" means the number is in the past and is handled by the relative-date
+    // parser above, so it must not also be read as a future offset here.
+    const agoSignal = /\bago\b/.test(lower);
+    const daysMatch = lower.match(/(\d+)\s*(?:day|days)\b/);
     const weeksMatch = lower.match(/(\d+)\s*(?:week|weeks)\b/);
     let daysOffset = 0;
-    if (daysMatch && dayNumber === null) daysOffset = parseInt(daysMatch[1], 10);
-    else if (weeksMatch) daysOffset = parseInt(weeksMatch[1], 10) * 7;
+    if (daysMatch && dayNumber === null && !agoSignal) daysOffset = parseInt(daysMatch[1], 10);
+    else if (weeksMatch && !agoSignal) daysOffset = parseInt(weeksMatch[1], 10) * 7;
 
     // Category of the action being logged.
     let category = 'check';
@@ -1247,9 +1369,32 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     const scheduleSignal = dayNumber !== null || daysOffset > 0
       || /\b(remind|reminder|schedule|scheduled|due|need to|needs to|will need|follow ?up|recheck|re-check|book)\b/.test(lower);
 
+    // A recurring "every N hours" check schedule, e.g. "schedule 12 hour checks"
+    // or "start 6 hour checks". When detected we lay out one reminder per
+    // interval across the next few days (3 by default), so foaling-watch style
+    // checks don't have to be entered one at a time.
+    const intervalMatch = lower.match(/(\d+)\s*-?\s*(?:hour|hr)s?\b/);
+    const seriesDaysMatch = lower.match(/next\s+(\d+)\s+days?/);
+    const wantsSeries = !!intervalMatch
+      && (/check/.test(lower) || /\b(schedule|start|every|begin)\b/.test(lower));
+    let scheduleSeries = null;
+    if (wantsSeries) {
+      const intervalHours = Math.max(1, parseInt(intervalMatch[1], 10));
+      const seriesDays = seriesDaysMatch ? Math.max(1, parseInt(seriesDaysMatch[1], 10)) : 3;
+      const count = Math.max(1, Math.floor((seriesDays * 24) / intervalHours));
+      scheduleSeries = {
+        intervalHours,
+        days: seriesDays,
+        count,
+        label: checkTask || 'Check',
+      };
+    }
+
     // --- Action taken (becomes a logged event when it has a date) ---
+    // A pure schedule request ("schedule 12 hour checks") describes no past
+    // action, so it never produces an action-taken event.
     let actionTaken = '';
-    if (takenVerb) {
+    if (takenVerb && !wantsSeries) {
       if (category === 'breed') actionTaken = /inseminat/.test(lower) ? 'Inseminated' : 'Bred';
       else if (category === 'short-cycle') actionTaken = 'Short cycled';
       else if (category === 'foaled') actionTaken = 'Foaled out';
@@ -1258,27 +1403,49 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
     }
     // If nothing was scheduled and we couldn't spot a past-tense verb, treat the
     // message as a logged note so the user still gets an event to keep or edit.
-    if (!actionTaken && !scheduleSignal) {
+    if (!actionTaken && !scheduleSignal && !wantsSeries) {
       actionTaken = checkTask || (category === 'breed' ? 'Bred' : category === 'short-cycle' ? 'Short cycled' : category === 'foaled' ? 'Foaled out' : category === 'drug' ? (drugName ? `Administered ${drugName}` : 'Administered drug') : 'Note');
     }
     const actionTakenDate = actionTaken ? (explicitDate || today()) : '';
 
+    // The category of what was done — recorded on the logged event.
+    const actionTakenCategory = category;
+
+    // Breeding always schedules a 14-day pregnancy check, even when the message
+    // gives no explicit reminder ("bred Bella today" still books the check).
+    const bredNow = category === 'breed' && !!actionTaken;
+
     // --- Action item (becomes a scheduled reminder) ---
     let actionItem = '';
     let dueDate = '';
-    if (scheduleSignal) {
-      if (checkTask) {
+    let actionRequiredCategory = 'check';
+    if (wantsSeries) {
+      const label = scheduleSeries.label;
+      actionItem = `${label === 'Check' ? `Check ${mareLabel}` : label} every ${scheduleSeries.intervalHours}h for ${scheduleSeries.days} days`;
+      actionRequiredCategory = 'check';
+      dueDate = today();
+    } else if (scheduleSignal || bredNow) {
+      if (category === 'breed' && (bredNow || takenVerb)) {
+        actionItem = `Check ${mareLabel} for pregnancy`;
+        actionRequiredCategory = 'check';
+      } else if (checkTask) {
         actionItem = checkTask;
+        actionRequiredCategory = 'check';
       } else if (category === 'breed') {
-        actionItem = takenVerb ? `Check ${mareLabel} for pregnancy` : `Breed ${mareLabel}`;
+        actionItem = `Breed ${mareLabel}`;
+        actionRequiredCategory = 'breed';
       } else if (category === 'drug') {
         actionItem = drugName ? `Administer ${drugName}` : 'Administer drug';
+        actionRequiredCategory = 'drug';
       } else if (category === 'short-cycle') {
         actionItem = `Short cycle ${mareLabel}`;
+        actionRequiredCategory = 'short-cycle';
       } else if (category === 'foaled') {
         actionItem = `${mareLabel} foaling due`;
+        actionRequiredCategory = 'foaled';
       } else {
         actionItem = 'Reminder';
+        actionRequiredCategory = 'check';
       }
       if (dayNumber !== null && !/\(day \d+\)/.test(actionItem)) actionItem += ` (day ${dayNumber})`;
 
@@ -1286,19 +1453,29 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
         dueDate = formatDate(addDays(parseLocalDate(breedAnchor() || actionTakenDate || today()), dayNumber));
       } else if (daysOffset > 0) {
         dueDate = formatDate(addDays(new Date(), daysOffset));
+      } else if (bredNow) {
+        // Default the pregnancy check to 14 days after the breeding date.
+        dueDate = formatDate(addDays(parseLocalDate(actionTakenDate || today()), 14));
       } else {
         dueDate = explicitDate && !takenVerb ? explicitDate : today();
       }
     }
 
+    // Breeding-cycle status the message implies, so logging it also moves the
+    // mare's status dropdown/badge (e.g. "bred Bella" -> Inseminated).
+    const breedingStatusUpdate = actionTaken ? inferBreedingStatus(lower, actionTakenCategory) : '';
+
     return {
       horseId: horse?.id || null,
       horseName: horse?.barnName || 'Unknown',
-      category,
+      actionTakenCategory,
       actionTaken,
       actionTakenDate,
+      actionRequiredCategory,
       actionItem,
       dueDate,
+      scheduleSeries,
+      breedingStatusUpdate,
       note: text,
     };
   };
@@ -1371,25 +1548,51 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
           id: `e${Date.now()}`,
           horseId: confirmData.horseId,
           date: confirmData.actionTakenDate,
-          type: confirmData.category,
+          type: confirmData.actionTakenCategory,
           title: confirmData.actionTaken,
           detail: confirmData.note || '',
         });
         created.push('event');
       }
-      // An action item becomes a scheduled reminder, so it surfaces on the horse
-      // profile, the home reminders list, and the calendar on its due date.
-      if (confirmData.actionItem) {
+
+      // A recurring check schedule lays out one reminder per interval across the
+      // requested window, each stamped with the date and time it falls on.
+      if (confirmData.scheduleSeries && confirmData.scheduleSeries.count > 0) {
+        const { intervalHours, count, label } = confirmData.scheduleSeries;
+        const base = Date.now();
+        for (let i = 1; i <= count; i++) {
+          const when = new Date(base + i * intervalHours * 60 * 60 * 1000);
+          const timeLabel = when.toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+          onAddAction({
+            id: `a${base + i}`,
+            horseId: confirmData.horseId,
+            category: 'check',
+            title: `${label} (${timeLabel})`,
+            note: confirmData.note || '',
+            dueDate: formatDate(when),
+            done: false,
+          });
+        }
+        created.push(`${count} scheduled checks`);
+      } else if (confirmData.actionItem) {
+        // An action item becomes a scheduled reminder, so it surfaces on the horse
+        // profile, the home reminders list, and the calendar on its due date.
         onAddAction({
           id: `a${Date.now() + 1}`,
           horseId: confirmData.horseId,
-          category: confirmData.category,
+          category: confirmData.actionRequiredCategory,
           title: confirmData.actionItem,
           note: confirmData.note || '',
           dueDate: confirmData.dueDate || today(),
           done: false,
         });
         created.push('action item');
+      }
+
+      // Logging what happened can also advance the mare's breeding-cycle status.
+      if (confirmData.breedingStatusUpdate && onUpdateBreedingStatus) {
+        onUpdateBreedingStatus(confirmData.horseId, confirmData.breedingStatusUpdate);
+        created.push('mare status');
       }
     }
 
@@ -1398,7 +1601,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
       ? `⚠️ Pick a horse first — nothing was saved.`
       : created.length === 0
         ? `⚠️ Nothing to save — add an action taken or an action item.`
-        : `✅ Saved ${created.join(' and ')} for ${confirmData.horseName}.`;
+        : `✅ Saved ${created.join(', ')} for ${confirmData.horseName}.`;
 
     const updatedMessages = messages.filter(m => m.confirmData?.id !== confirmData.id);
     setMessages([
@@ -1551,25 +1754,6 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                       padding: DS.spacing.lg,
                       marginBottom: DS.spacing.md,
                     }}>
-                      {/* Category Badge */}
-                      <div style={{ marginBottom: DS.spacing.lg }}>
-                        <div
-                          style={{
-                            display: 'inline-block',
-                            padding: `${DS.spacing.xs} ${DS.spacing.md}`,
-                            background: DS.colors.primary,
-                            color: 'white',
-                            borderRadius: DS.radius.full,
-                            fontSize: DS.typography.size.xs,
-                            fontWeight: DS.typography.weight.semibold,
-                            textTransform: 'uppercase',
-                            letterSpacing: '0.05em',
-                          }}
-                        >
-                          {categoryLabel(msg.confirmData.category)}
-                        </div>
-                      </div>
-
                       <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
                         <div style={styles.label}>Mare</div>
                         <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.horseName}</p>
@@ -1577,8 +1761,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 
                       {/* Action taken -> becomes a timeline event */}
                       <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={{...styles.label, color: msg.confirmData.actionTaken ? DS.colors.success : DS.colors.textMuted}}>
-                          ✓ Action Taken
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: DS.spacing.sm }}>
+                          <div style={{...styles.label, color: msg.confirmData.actionTaken ? DS.colors.success : DS.colors.textMuted}}>
+                            ✓ Action Taken
+                          </div>
+                          {msg.confirmData.actionTaken && (
+                            <span style={categoryChip}>{categoryLabel(msg.confirmData.actionTakenCategory)}</span>
+                          )}
                         </div>
                         {msg.confirmData.actionTaken ? (
                           <>
@@ -1594,20 +1783,37 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 
                       {/* Action item -> becomes a scheduled reminder */}
                       <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
-                        <div style={{...styles.label, color: msg.confirmData.actionItem ? DS.colors.gold : DS.colors.textMuted}}>
-                          → Action Required
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: DS.spacing.sm }}>
+                          <div style={{...styles.label, color: msg.confirmData.actionItem ? DS.colors.gold : DS.colors.textMuted}}>
+                            → Action Required
+                          </div>
+                          {msg.confirmData.actionItem && (
+                            <span style={categoryChip}>{categoryLabel(msg.confirmData.actionRequiredCategory)}</span>
+                          )}
                         </div>
                         {msg.confirmData.actionItem ? (
                           <>
                             <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold}}>{msg.confirmData.actionItem}</p>
                             <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
-                              {msg.confirmData.dueDate ? `Due ${relativeDate(msg.confirmData.dueDate)}` : 'Due today'}
+                              {msg.confirmData.scheduleSeries
+                                ? `${msg.confirmData.scheduleSeries.count} reminders, every ${msg.confirmData.scheduleSeries.intervalHours}h starting ${relativeDate(msg.confirmData.dueDate)}`
+                                : msg.confirmData.dueDate ? `Due ${relativeDate(msg.confirmData.dueDate)}` : 'Due today'}
                             </p>
                           </>
                         ) : (
                           <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>None</p>
                         )}
                       </div>
+
+                      {/* Mare status update */}
+                      {msg.confirmData.breedingStatusUpdate && (
+                        <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
+                          <div style={styles.label}>Mare Status →</div>
+                          <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold, color: getStatusColor(msg.confirmData.breedingStatusUpdate)}}>
+                            {msg.confirmData.breedingStatusUpdate}
+                          </p>
+                        </div>
+                      )}
 
                       <div style={{ marginBottom: DS.spacing.md }}>
                         <div style={styles.label}>Additional Note</div>
@@ -1658,10 +1864,10 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                         </div>
 
                         <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Category</label>
+                          <label style={styles.label}>Action Taken Category</label>
                           <select
-                            value={editingConfirmation.category}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, category: e.target.value})}
+                            value={editingConfirmation.actionTakenCategory}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTakenCategory: e.target.value})}
                             style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
                           >
                             {ACTION_CATEGORIES.map(c => (
@@ -1692,6 +1898,19 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                         </div>
 
                         <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Action Required Category</label>
+                          <select
+                            value={editingConfirmation.actionRequiredCategory}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionRequiredCategory: e.target.value})}
+                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                          >
+                            {ACTION_CATEGORIES.map(c => (
+                              <option key={c.key} value={c.key}>{c.label}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
                           <label style={styles.label}>Action Required</label>
                           <input
                             type="text"
@@ -1719,6 +1938,20 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                             onChange={(e) => setEditingConfirmation({...editingConfirmation, note: e.target.value})}
                             style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '80px', fontFamily: DS.typography.family.base}}
                           />
+                        </div>
+
+                        <div style={{ marginTop: DS.spacing.lg }}>
+                          <label style={styles.label}>Mare Status (optional)</label>
+                          <select
+                            value={editingConfirmation.breedingStatusUpdate || ''}
+                            onChange={(e) => setEditingConfirmation({...editingConfirmation, breedingStatusUpdate: e.target.value})}
+                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                          >
+                            <option value="">Leave unchanged</option>
+                            {BREEDING_STATUSES.map(s => (
+                              <option key={s} value={s}>{s}</option>
+                            ))}
+                          </select>
                         </div>
 
                         <div style={{ display: 'flex', gap: DS.spacing.md, marginTop: DS.spacing.lg }}>
@@ -2835,15 +3068,16 @@ export default function App() {
           events={events}
           onBack={() => navigate('home')}
           onAddEvent={(event) => {
-            setEvents([...events, event]);
+            setEvents(prev => [...prev, event]);
             persistItem('events', event);
             flash(`Event logged!`);
           }}
           onAddAction={(action) => {
-            setActions([...actions, action]);
+            setActions(prev => [...prev, action]);
             persistItem('actions', action);
             flash(`Action added!`);
           }}
+          onUpdateBreedingStatus={handleUpdateStatus}
         />
       ) : activeTab === 'calendar' ? (
         <CalendarScreen actions={actions} events={events} horses={horses} />
