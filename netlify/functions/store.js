@@ -1,55 +1,72 @@
 import { getStore } from '@netlify/blobs';
 
-// Persists everything created on the site (horses, actions, events) so the
-// data survives page refreshes and redeploys — backed by Netlify Blobs, a
-// zero-configuration object store. No database, roles, migrations, or write
-// permissions are involved, which is what kept breaking before.
+// Persists everything created on the site (horses, actions, events) so the data
+// survives page refreshes, navigation, and redeploys — backed by Netlify Blobs,
+// a zero-configuration object store that is built into the Netlify runtime.
+//
+// Why Blobs instead of a database: this data is just self-contained JSON records
+// keyed by a client-generated id. There is nothing relational to query or join —
+// the site loads everything at once and saves one record at a time. Blobs needs
+// no connection string, no driver, and no migrations, so the whole class of
+// deploy-only connection/bundling failures that plagued the database approach
+// simply cannot happen here.
+//
+// Each record is stored as its own blob under the key `<collection>/<id>` (e.g.
+// `horses/abc123`). Storing one blob per record — rather than one big array per
+// collection — means two rapid saves to different records can never clobber each
+// other, and a delete only touches the one record.
 //
 //   GET    -> returns { horses, actions, events } as arrays of records
-//   PUT    -> body { collection, item }  upserts one record (insert or update)
+//   PUT    -> body { collection, item }  saves one record (key collection/id)
 //   DELETE -> body { collection, id }    removes one record
 //
-// Each record is stored as its own JSON blob under the key `<collection>/<id>`.
-// Strong consistency is used so a freshly created record is readable
-// immediately after a page refresh (the default eventual mode can lag up to a
-// minute, which is exactly the "it vanished on refresh" symptom).
+// Strong consistency is used so a record is readable on the very next request —
+// without it, a save followed immediately by a refresh could read stale data
+// (Blobs' default eventual consistency can lag up to ~60s), which would look
+// exactly like "nothing saved".
 const COLLECTIONS = ['horses', 'actions', 'events'];
 
-const store = () => getStore({ name: 'breeding-data', consistency: 'strong' });
+const store = () => getStore({ name: 'app-data', consistency: 'strong' });
 
-export const handler = async (event) => {
+const json = (status, body) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+export default async (req) => {
   try {
-    const data = store();
+    const blobs = store();
 
-    if (event.httpMethod === 'GET') {
+    if (req.method === 'GET') {
       const result = {};
       await Promise.all(
         COLLECTIONS.map(async (collection) => {
-          const { blobs } = await data.list({ prefix: `${collection}/` });
-          const items = await Promise.all(
-            blobs.map((b) => data.get(b.key, { type: 'json' })),
+          const { blobs: entries } = await blobs.list({ prefix: `${collection}/` });
+          const records = await Promise.all(
+            entries.map((entry) => blobs.get(entry.key, { type: 'json' })),
           );
-          result[collection] = items.filter(Boolean);
+          result[collection] = records.filter(Boolean);
         }),
       );
       return json(200, result);
     }
 
-    if (event.httpMethod === 'PUT' || event.httpMethod === 'POST') {
-      const { collection, item } = JSON.parse(event.body || '{}');
+    if (req.method === 'PUT' || req.method === 'POST') {
+      const { collection, item } = await req.json().catch(() => ({}));
       if (!COLLECTIONS.includes(collection)) return json(400, { error: 'Unknown collection' });
       if (!item || !item.id) return json(400, { error: 'Item with an id is required' });
 
-      await data.setJSON(`${collection}/${item.id}`, item);
+      await blobs.setJSON(`${collection}/${item.id}`, item);
       return json(200, { ok: true });
     }
 
-    if (event.httpMethod === 'DELETE') {
-      const { collection, id } = JSON.parse(event.body || '{}');
+    if (req.method === 'DELETE') {
+      const { collection, id } = await req.json().catch(() => ({}));
       if (!COLLECTIONS.includes(collection)) return json(400, { error: 'Unknown collection' });
       if (!id) return json(400, { error: 'An id is required' });
 
-      await data.delete(`${collection}/${id}`);
+      await blobs.delete(`${collection}/${id}`);
       return json(200, { ok: true });
     }
 
@@ -59,9 +76,3 @@ export const handler = async (event) => {
     return json(500, { error: error.message || 'Internal server error' });
   }
 };
-
-const json = (statusCode, body) => ({
-  statusCode,
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(body),
-});

@@ -1877,36 +1877,69 @@ export default function App() {
   const [toast, setToast] = useState('');
 
   // Load all previously saved data once on startup so records survive refreshes.
+  // Retries a couple of times because the storage function can be slow to wake
+  // on a cold start, and a single failed request would otherwise leave the app
+  // looking empty even though the data is safely stored.
   useEffect(() => {
     let cancelled = false;
-    fetch('/.netlify/functions/store')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
+    const load = async (attempt = 0) => {
+      try {
+        const res = await fetch('/.netlify/functions/store');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
         if (cancelled || !data) return;
         if (Array.isArray(data.horses)) setHorses(data.horses);
         if (Array.isArray(data.actions)) setActions(data.actions);
         if (Array.isArray(data.events)) setEvents(data.events);
-      })
-      .catch((err) => console.error('Failed to load saved data:', err));
+      } catch (err) {
+        console.error('Failed to load saved data:', err);
+        if (cancelled) return;
+        if (attempt < 2) {
+          setTimeout(() => load(attempt + 1), 800 * (attempt + 1));
+        } else {
+          flash('Could not load saved data — check your connection');
+        }
+      }
+    };
+    load();
     return () => { cancelled = true; };
   }, []);
 
-  // Save (insert or update) a single record. Fire-and-forget: the UI updates
-  // immediately and the write happens in the background.
-  const persistItem = (collection, item) => {
-    fetch('/.netlify/functions/store', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ collection, item }),
-    }).catch((err) => console.error(`Failed to save ${collection}:`, err));
+  // Save (insert or update) a single record. Awaits the server so the write
+  // actually commits before the user can navigate away or refresh — a
+  // fire-and-forget write could be dropped mid-flight on a slow connection,
+  // making it look like nothing was saved. Surfaces any failure to the user
+  // instead of swallowing it silently.
+  const persistItem = async (collection, item) => {
+    try {
+      const res = await fetch('/.netlify/functions/store', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection, item }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+      return true;
+    } catch (err) {
+      console.error(`Failed to save ${collection}:`, err);
+      flash('Could not save — check your connection and try again');
+      return false;
+    }
   };
 
-  const removeItem = (collection, id) => {
-    fetch('/.netlify/functions/store', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ collection, id }),
-    }).catch((err) => console.error(`Failed to delete ${collection}:`, err));
+  const removeItem = async (collection, id) => {
+    try {
+      const res = await fetch('/.netlify/functions/store', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection, id }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return true;
+    } catch (err) {
+      console.error(`Failed to delete ${collection}:`, err);
+      flash('Could not delete — check your connection and try again');
+      return false;
+    }
   };
 
   const flash = (msg) => {
