@@ -80,6 +80,13 @@ const calculateAge = (yob) => {
   return now.getFullYear() - yob;
 };
 
+const formatDate = (d) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return d;
+  return dt.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
 const getActionTitleWithMareName = (action, horses) => {
   const horse = horses.find(h => h.id === action.horseId);
   const mareName = horse ? horse.nickname || horse.barnName : 'Unknown';
@@ -218,10 +225,17 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
               </div>
               <div>
                 <div style={styles.label}>Born</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.yob}</p>
+                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dob ? formatDate(horse.dob) : horse.yob}</p>
               </div>
             </div>
           </div>
+
+          {horse.additionalInfo && (
+            <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+              <div style={styles.label}>Additional Information</div>
+              <p style={{...styles.body, marginTop: DS.spacing.sm, whiteSpace: 'pre-wrap'}}>{horse.additionalInfo}</p>
+            </div>
+          )}
 
           {/* Breeding Management */}
           {horse.type === 'mare' && (
@@ -375,9 +389,13 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                   <div style={styles.label}>Sire</div>
                   <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.sire}</p>
                 </div>
-                <div>
+                <div style={{ marginBottom: DS.spacing.lg }}>
                   <div style={styles.label}>Dam</div>
                   <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dam}</p>
+                </div>
+                <div>
+                  <div style={styles.label}>Dam Sire</div>
+                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.damSire || 'Unknown'}</p>
                 </div>
               </div>
             </>
@@ -1105,7 +1123,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [filterType, setFilterType] = useState('all');
-  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), color: '', sire: '', dam: '', type: 'mare' });
+  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', dob: '', color: '', sire: '', dam: '', damSire: '', additionalInfo: '', type: 'mare' });
   const [showBornModal, setShowBornModal] = useState(false);
   const [selectedBornHorse, setSelectedBornHorse] = useState(null);
   const [foalForm, setFoalForm] = useState({ name: '', gender: 'filly' });
@@ -1113,7 +1131,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const handleAdd = () => {
     if (formData.barnName && formData.breed) {
       onAddHorse(formData);
-      setFormData({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), color: '', sire: '', dam: '', type: 'mare' });
+      setFormData({ barnName: '', nickname: '', breed: '', dob: '', color: '', sire: '', dam: '', damSire: '', additionalInfo: '', type: 'mare' });
       setShowAddForm(false);
     }
   };
@@ -1193,8 +1211,8 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
                 <input type="text" value={formData.breed} onChange={(e) => setFormData({...formData, breed: e.target.value})} placeholder="e.g., KWPN" style={{...styles.input, marginTop: DS.spacing.sm}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg }}>
-                <label style={styles.label}>Year of Birth</label>
-                <input type="number" value={formData.yob} onChange={(e) => setFormData({...formData, yob: e.target.value ? parseInt(e.target.value, 10) : ''})} placeholder="e.g., 2018" style={{...styles.input, marginTop: DS.spacing.sm}} />
+                <label style={styles.label}>Date of Birth</label>
+                <input type="date" value={formData.dob} onChange={(e) => setFormData({...formData, dob: e.target.value})} style={{...styles.input, marginTop: DS.spacing.sm}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg }}>
                 <label style={styles.label}>Color (optional)</label>
@@ -1207,6 +1225,14 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
               <div style={{ marginTop: DS.spacing.lg }}>
                 <label style={styles.label}>Dam (optional)</label>
                 <input type="text" value={formData.dam} onChange={(e) => setFormData({...formData, dam: e.target.value})} placeholder="Mother's name" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam Sire (optional)</label>
+                <input type="text" value={formData.damSire} onChange={(e) => setFormData({...formData, damSire: e.target.value})} placeholder="Maternal grandsire's name" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Additional Information (optional)</label>
+                <textarea value={formData.additionalInfo} onChange={(e) => setFormData({...formData, additionalInfo: e.target.value})} placeholder="Notes, registration details, health history, etc." rows={4} style={{...styles.input, marginTop: DS.spacing.sm, resize: 'vertical', fontFamily: 'inherit'}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleAdd} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
@@ -1240,10 +1266,11 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
                       nickname: foalForm.name,
                       type: 'foal',
                       breed: horse.breed,
-                      yob: new Date().getFullYear(),
+                      dob: new Date().toISOString().split('T')[0],
                       color: horse.expectedFoalColor || horse.color,
                       sire: horse.plannedStallion,
                       dam: horse.barnName,
+                      damSire: horse.sire,
                     });
                     flash(`${foalForm.name} born!`);
                     setShowBornModal(false);
@@ -1911,14 +1938,22 @@ export default function App() {
   }, [loaded]);
 
   const handleAddHorse = (formData) => {
+    const dob = formData.dob || '';
+    const yob = dob && !isNaN(new Date(dob).getTime())
+      ? new Date(dob).getFullYear()
+      : (formData.yob || new Date().getFullYear());
     const newHorse = {
       id: `h${Date.now()}`,
       ...formData,
+      dob,
+      yob,
       name: formData.name || formData.barnName,
       nickname: formData.nickname || formData.barnName,
       color: formData.color || 'Bay',
       sire: formData.sire || 'Unknown',
       dam: formData.dam || 'Unknown',
+      damSire: formData.damSire || 'Unknown',
+      additionalInfo: formData.additionalInfo || '',
       breedingStatus: formData.type === 'mare' ? 'Waiting for cycle' : null,
       plannedStallion: null,
       expectedFoalColor: null,
