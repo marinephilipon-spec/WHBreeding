@@ -48,6 +48,17 @@ Provide a concise, helpful answer based on the data. Use the horse nicknames/nam
       let text = data.content[0].text;
       // Clean up any formatting artifacts
       text = text.replace(/^\{\{/, '').replace(/\}\}$/, '').trim();
+
+      // Persist the question/answer so assistant history survives refreshes.
+      // Wrapped defensively so a database issue never breaks the response.
+      try {
+        const { db } = await import('../../db/index.js');
+        const { chatHistory } = await import('../../db/schema.js');
+        await db.insert(chatHistory).values({ question, answer: text });
+      } catch (dbError) {
+        console.error('Failed to persist chat history:', dbError);
+      }
+
       return {
         statusCode: 200,
         body: JSON.stringify({ text }),
