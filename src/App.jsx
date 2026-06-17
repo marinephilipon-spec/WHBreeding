@@ -1031,7 +1031,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
                       </div>
                     )}
                   </div>
-                )}}
+                )}
 
                 {/* Success message */}
                 {msg.role === 'assistant' && msg.success && (
@@ -1810,6 +1810,10 @@ export default function App() {
   // overwrite saved data with the empty starting state before it arrives.
   const [loaded, setLoaded] = useState(false);
   const saveTimer = useRef(null);
+  // Always holds the most recent state so the page-unload handler can flush it
+  // synchronously without depending on effect closures.
+  const latestState = useRef({ horses, actions, events });
+  latestState.current = { horses, actions, events };
 
   const flash = (msg) => {
     setToast(msg);
@@ -1822,18 +1826,20 @@ export default function App() {
     (async () => {
       try {
         const res = await fetch('/api/state');
-        if (res.ok) {
-          const data = await res.json();
-          if (!cancelled) {
-            if (Array.isArray(data.horses)) setHorses(data.horses);
-            if (Array.isArray(data.actions)) setActions(data.actions);
-            if (Array.isArray(data.events)) setEvents(data.events);
-          }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!cancelled && data) {
+          if (Array.isArray(data.horses)) setHorses(data.horses);
+          if (Array.isArray(data.actions)) setActions(data.actions);
+          if (Array.isArray(data.events)) setEvents(data.events);
         }
+        // Only enable saving after a SUCCESSFUL read of the server state. If the
+        // load fails (e.g. a transient error or a cold function start), saving
+        // stays disabled so the empty starting state can never overwrite the
+        // real data already stored on the server.
+        if (!cancelled) setLoaded(true);
       } catch (err) {
         console.error('Failed to load saved data:', err);
-      } finally {
-        if (!cancelled) setLoaded(true);
       }
     })();
     return () => {
@@ -1850,12 +1856,43 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ horses, actions, events }),
+        keepalive: true,
       }).catch((err) => console.error('Failed to save data:', err));
     }, 600);
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
   }, [horses, actions, events, loaded]);
+
+  // Flush the latest state immediately when the page is hidden or unloaded, so
+  // a refresh right after a change can't lose data still waiting in the debounce.
+  useEffect(() => {
+    if (!loaded) return;
+    const flush = () => {
+      const payload = JSON.stringify(latestState.current);
+      try {
+        const blob = new Blob([payload], { type: 'application/json' });
+        if (navigator.sendBeacon && navigator.sendBeacon('/api/state', blob)) return;
+      } catch (err) {
+        // Fall through to a keepalive fetch below.
+      }
+      fetch('/api/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [loaded]);
 
   const handleAddHorse = (formData) => {
     const newHorse = {
