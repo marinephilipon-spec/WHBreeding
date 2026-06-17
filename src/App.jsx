@@ -1105,7 +1105,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction }
 function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [filterType, setFilterType] = useState('all');
-  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+  const [formData, setFormData] = useState({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), color: '', sire: '', dam: '', type: 'mare' });
   const [showBornModal, setShowBornModal] = useState(false);
   const [selectedBornHorse, setSelectedBornHorse] = useState(null);
   const [foalForm, setFoalForm] = useState({ name: '', gender: 'filly' });
@@ -1113,7 +1113,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
   const handleAdd = () => {
     if (formData.barnName && formData.breed) {
       onAddHorse(formData);
-      setFormData({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), type: 'mare' });
+      setFormData({ barnName: '', nickname: '', breed: '', yob: new Date().getFullYear(), color: '', sire: '', dam: '', type: 'mare' });
       setShowAddForm(false);
     }
   };
@@ -1191,6 +1191,22 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
               <div style={{ marginTop: DS.spacing.lg }}>
                 <label style={styles.label}>Breed</label>
                 <input type="text" value={formData.breed} onChange={(e) => setFormData({...formData, breed: e.target.value})} placeholder="e.g., KWPN" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Year of Birth</label>
+                <input type="number" value={formData.yob} onChange={(e) => setFormData({...formData, yob: e.target.value ? parseInt(e.target.value, 10) : ''})} placeholder="e.g., 2018" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Color (optional)</label>
+                <input type="text" value={formData.color} onChange={(e) => setFormData({...formData, color: e.target.value})} placeholder="e.g., Bay" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Sire (optional)</label>
+                <input type="text" value={formData.sire} onChange={(e) => setFormData({...formData, sire: e.target.value})} placeholder="Father's name" style={{...styles.input, marginTop: DS.spacing.sm}} />
+              </div>
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Dam (optional)</label>
+                <input type="text" value={formData.dam} onChange={(e) => setFormData({...formData, dam: e.target.value})} placeholder="Mother's name" style={{...styles.input, marginTop: DS.spacing.sm}} />
               </div>
               <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
                 <button onClick={handleAdd} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save</button>
