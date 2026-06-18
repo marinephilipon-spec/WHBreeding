@@ -10,11 +10,16 @@
 // Connection: requests go to the Netlify AI Gateway, NOT directly to Anthropic.
 // Netlify injects ANTHROPIC_BASE_URL (the gateway endpoint) and ANTHROPIC_API_KEY
 // (the gateway credential) into every server context — so the function never
-// holds a real provider key, and billing flows through the Netlify account. The
-// `anthropic-version` header is required by the Messages API; without it the
-// request is rejected, which is why the previous hardcoded call to
-// api.anthropic.com failed.
-const ANTHROPIC_VERSION = '2023-06-01';
+// holds a real provider key, and billing flows through the Netlify account. We
+// use the official Anthropic SDK, which auto-detects those variables and sets
+// the required `anthropic-version` header itself, instead of hand-rolling the
+// HTTP call (the previous hardcoded call to api.anthropic.com is what failed).
+//
+// NOTE: the AI Gateway variables are only injected once the site has a published
+// production deploy with AI features enabled. Until then `getClient()` below
+// throws the "AI Gateway is not configured" error that surfaces in the chat.
+import Anthropic from '@anthropic-ai/sdk';
+
 const MODEL = 'claude-sonnet-4-6';
 
 // Kept in sync with BREEDING_STATUSES in src/App.jsx — these are the only
@@ -34,39 +39,26 @@ const CATEGORIES = ['check', 'breed', 'drug', 'short-cycle', 'foaled'];
 // callers can fall back gracefully.
 //
 // Routing is always through the Netlify AI Gateway and NEVER the public Anthropic
-// API. Netlify injects ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY in server contexts,
-// and NETLIFY_AI_GATEWAY_BASE_URL / NETLIFY_AI_GATEWAY_KEY are always set as a
-// backstop. We deliberately do not fall back to api.anthropic.com: the gateway
-// credential is not a valid Anthropic key, so sending it there returns
-// "invalid x-api-key" — the exact failure this guards against.
-const callClaude = async (payload) => {
-  const rawBase = process.env.ANTHROPIC_BASE_URL || process.env.NETLIFY_AI_GATEWAY_BASE_URL;
+// API. The SDK auto-detects ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, but we resolve
+// them explicitly (falling back to the always-present NETLIFY_AI_GATEWAY_* pair)
+// so a missing configuration is reported as a clear, catchable error rather than
+// crashing at module load, and so the trailing slash on the injected base URL is
+// trimmed before the SDK appends `/v1/messages`.
+let client;
+const getClient = () => {
+  if (client) return client;
   const apiKey = process.env.ANTHROPIC_API_KEY || process.env.NETLIFY_AI_GATEWAY_KEY;
-  if (!rawBase || !apiKey) {
+  const rawBase = process.env.ANTHROPIC_BASE_URL || process.env.NETLIFY_AI_GATEWAY_BASE_URL;
+  if (!apiKey || !rawBase) {
     throw new Error(
       'AI Gateway is not configured. Ensure the site has a production deploy with AI features enabled.',
     );
   }
-  // The injected base URL ends with a slash (".../.netlify/ai/"); trim it so we
-  // don't build a double-slash path.
-  const baseUrl = rawBase.replace(/\/+$/, '');
-  const response = await fetch(`${baseUrl}/v1/messages`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({ model: MODEL, ...payload }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    const message = data?.error?.message || `Gateway returned ${response.status}`;
-    throw new Error(message);
-  }
-  return data;
+  client = new Anthropic({ apiKey, baseURL: rawBase.replace(/\/+$/, '') });
+  return client;
 };
+
+const callClaude = (payload) => getClient().messages.create({ model: MODEL, ...payload });
 
 // --- mode: 'ask' -------------------------------------------------------------
 const answerQuestion = async ({ question, context }) => {
