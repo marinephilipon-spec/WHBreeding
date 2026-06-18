@@ -22,18 +22,28 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const MODEL = 'claude-sonnet-4-6';
 
-// Kept in sync with BREEDING_STATUSES in src/App.jsx — these are the only
-// statuses the mare dropdown understands, so the model must pick from this set.
-const BREEDING_STATUSES = [
-  'Waiting for cycle',
-  'Ready to breed',
-  'Inseminated',
-  '14-day pregnancy check',
-  'Confirmed in foal',
-  'Lost - back open',
+// The event types the breeding log understands — kept in sync with EVENT_TYPES
+// in src/App.jsx. The model classifies each note into exactly ONE of these so the
+// client can feed the result through the same deriveEvent() pipeline the local
+// rule-based parser uses. That shared pipeline — not this function — is what turns
+// an event type into the card title, follow-up actions, and breeding-status move,
+// so the AI path and the offline fallback produce an identical confirmation card.
+const EVENT_TYPES = [
+  'insemination',
+  'ultrasound',
+  'ovulation',
+  'pregnancy-check',
+  'heartbeat',
+  'lutalyse',
+  'monitoring',
+  'double-ovulation',
+  'uterine-issue',
+  'pregnancy-loss',
+  'foaled',
+  'note',
 ];
 
-const CATEGORIES = ['check', 'breed', 'drug', 'short-cycle', 'foaled'];
+const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 
 // Single place that talks to the gateway. Throws on a transport/HTTP error so
 // callers can fall back gracefully.
@@ -89,86 +99,127 @@ const answerQuestion = async ({ question, context }) => {
 };
 
 // --- mode: 'log' -------------------------------------------------------------
-// A tool is used (rather than free-text JSON) so the model is forced to return
-// an object that matches the confirmation card's shape exactly — no parsing of
-// loosely-formatted text, and enums are validated by the schema.
+// A tool is used (rather than free-text JSON) so the model is forced to return a
+// well-typed object. The fields below mirror the ones the app's own rule-based
+// parser extracts; the client (normalizeParsed) maps them straight into the
+// shared deriveEvent() factory, so a note parsed by the AI yields exactly the
+// same confirmation card, save payload, and editable form as one parsed offline.
 const LOG_TOOL = {
   name: 'record_breeding_entry',
   description:
-    'Record the structured breeding-log entry parsed from the keeper\'s message. ' +
-    'A message can describe something that already happened (an action taken), ' +
-    'something to do later (an action item / reminder), or both.',
+    "Record the structured breeding-log entry parsed from the keeper's free-form note. " +
+    'Classify what happened into a single eventType and extract its details, resolving ' +
+    'every relative date to an absolute calendar date.',
   input_schema: {
     type: 'object',
     properties: {
       horseId: {
         type: ['string', 'null'],
         description:
-          'The id of the horse this message is about, chosen from the provided list. ' +
-          'null if no horse can be identified.',
+          'The id of the mare this note is about, chosen from the provided list. ' +
+          'null if no mare can be identified.',
       },
-      horseName: {
+      eventType: {
         type: 'string',
-        description: 'The barn name of the matched horse, or "Unknown".',
+        enum: EVENT_TYPES,
+        description:
+          'The single best-matching event type. Use "note" only when nothing more ' +
+          'specific fits. Bred/inseminated/covered -> "insemination"; scan/ultrasound -> ' +
+          '"ultrasound"; ovulation confirmed -> "ovulation"; 14-day or embryo pregnancy ' +
+          'check -> "pregnancy-check"; 28-day heartbeat check -> "heartbeat"; gave ' +
+          'lutalyse/lute/prostaglandin -> "lutalyse"; recurring N-hour checks -> ' +
+          '"monitoring"; double ovulation -> "double-ovulation"; uterine infection/fluid/' +
+          'flush -> "uterine-issue"; reabsorbed/slipped/lost the foal -> "pregnancy-loss"; ' +
+          'foaled/gave birth -> "foaled".',
       },
-      actionTakenCategory: { type: 'string', enum: CATEGORIES },
-      actionTaken: {
+      date: {
         type: 'string',
         description:
-          'Short label of what already happened (e.g. "Bred", "Administered Regumate", ' +
-          '"Ultrasound check", "Foaled out"). Empty string if the message only schedules ' +
-          'something for later.',
+          'ISO date (YYYY-MM-DD) the event happened, resolving relative terms like ' +
+          '"yesterday" / "this morning" against today\'s date. Empty string -> today.',
       },
-      actionTakenDate: {
+      time: {
+        type: 'string',
+        description: '24-hour time (HH:MM) if the note states one, else empty string.',
+      },
+      semenType: {
+        type: 'string',
+        enum: ['fresh', 'chilled', 'frozen', 'natural', ''],
+        description: 'For an insemination, the semen type mentioned, else empty string.',
+      },
+      stallion: {
+        type: 'string',
+        description: 'For an insemination, the stallion / sire named, else empty string.',
+      },
+      follicleRight: {
         type: 'string',
         description:
-          'ISO date (YYYY-MM-DD) the action was taken, resolving relative terms like ' +
-          '"yesterday" against today\'s date. Empty string if no action was taken.',
+          'Right-ovary follicle size in mm (digits only) for an ultrasound / monitoring ' +
+          'note, else empty string.',
       },
-      actionRequiredCategory: { type: 'string', enum: CATEGORIES },
-      actionItem: {
+      follicleLeft: {
         type: 'string',
         description:
-          'Short label of a reminder to schedule (e.g. "Check Bella for pregnancy"). ' +
-          'Empty string if nothing is being scheduled.',
+          'Left-ovary follicle size in mm (digits only) for an ultrasound / monitoring ' +
+          'note, else empty string.',
       },
-      dueDate: {
+      dose: {
         type: 'string',
-        description:
-          'ISO date (YYYY-MM-DD) the reminder is due. Resolve "in 2 weeks", "day 28" ' +
-          '(N days after the breeding date), etc. Empty string if no reminder.',
+        description: 'Drug dose for a lutalyse note (e.g. "0.5"), else empty string.',
       },
-      scheduleSeries: {
+      result: {
+        type: 'string',
+        enum: ['positive', 'negative', ''],
+        description:
+          'For a pregnancy check: "positive" if an embryo / pregnancy was found, ' +
+          '"negative" if open / empty / not in foal, else empty string.',
+      },
+      series: {
         type: ['object', 'null'],
         description:
           'Only for recurring checks like "12 hour checks for 3 days". null otherwise.',
         properties: {
           intervalHours: { type: 'number' },
           days: { type: 'number' },
-          label: { type: 'string' },
         },
       },
-      breedingStatusUpdate: {
-        type: 'string',
-        enum: [...BREEDING_STATUSES, ''],
+      extraActions: {
+        type: 'array',
         description:
-          'The breeding-cycle status this message implies, or empty string if none. ' +
-          'Breeding/insemination -> "Inseminated"; confirmed pregnant/heartbeat -> ' +
-          '"Confirmed in foal"; lost/reabsorbed/back open -> "Lost - back open".',
+          'Follow-up reminders the keeper explicitly asks to schedule, on top of whatever ' +
+          'the event type already implies (e.g. "remind me in 3 days to call the vet", ' +
+          '"recheck her on day 28"). Empty array if none. Do NOT include the routine ' +
+          'follow-ups an event type already creates on its own.',
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Short label, e.g. "Call the vet".' },
+            dueDate: {
+              type: 'string',
+              description:
+                'ISO date (YYYY-MM-DD) the reminder is due, resolved absolutely. "day N" ' +
+                'counts N days from the mare\'s most recent breeding date.',
+            },
+            priority: { type: 'string', enum: PRIORITIES },
+          },
+          required: ['title', 'dueDate', 'priority'],
+        },
       },
-      note: { type: 'string', description: 'The original message text, verbatim.' },
+      note: { type: 'string', description: 'The original note text, verbatim.' },
     },
     required: [
       'horseId',
-      'horseName',
-      'actionTakenCategory',
-      'actionTaken',
-      'actionTakenDate',
-      'actionRequiredCategory',
-      'actionItem',
-      'dueDate',
-      'scheduleSeries',
-      'breedingStatusUpdate',
+      'eventType',
+      'date',
+      'time',
+      'semenType',
+      'stallion',
+      'follicleRight',
+      'follicleLeft',
+      'dose',
+      'result',
+      'series',
+      'extraActions',
       'note',
     ],
   },
@@ -182,23 +233,25 @@ const parseLogEntry = async ({ message, horses, breedingDates, today, fallbackHo
     system:
       "You parse a horse breeder's free-form note into a structured log entry by " +
       `calling the ${LOG_TOOL.name} tool. Today's date is ${today}.\n\n` +
-      'Horses (use these ids exactly):\n' +
+      'Mares (use these ids exactly):\n' +
       JSON.stringify(horses, null, 2) +
-      '\n\nMost recent breeding date per horse id (for resolving "day N" reminders, ' +
+      '\n\nMost recent breeding date per mare id (for resolving "day N" reminders, ' +
       'which count N days from the breeding date):\n' +
       JSON.stringify(breedingDates, null, 2) +
       (fallbackHorseId
-        ? `\n\nIf the message names no horse, assume it is about horse id "${fallbackHorseId}" ` +
+        ? `\n\nIf the note names no mare, assume it is about mare id "${fallbackHorseId}" ` +
           '(the one the conversation was already about).'
         : '') +
       '\n\nGuidance:\n' +
-      '- A breeding/insemination ("bred Bella today") should also schedule a 14-day ' +
-      'pregnancy check as the action item, due 14 days after the breeding date.\n' +
-      '- "day 28" means 28 days after the mare\'s most recent breeding date.\n' +
-      '- "in 2 weeks" / "in 10 days" are offsets from today.\n' +
-      '- Resolve every date to an absolute YYYY-MM-DD value.\n' +
-      '- Leave actionTaken empty for pure scheduling requests, and leave actionItem ' +
-      'empty when nothing is scheduled.',
+      '- Pick the single eventType that best matches; use "note" only as a last resort.\n' +
+      '- Resolve EVERY date to an absolute YYYY-MM-DD value: "yesterday" is relative to ' +
+      'today, "day 28" means 28 days after the mare\'s most recent breeding date, and ' +
+      '"in 2 weeks" / "in 10 days" are offsets from today.\n' +
+      '- The routine follow-ups for an event (e.g. the 14-day pregnancy check after an ' +
+      'insemination) are added automatically downstream — only put genuinely extra, ' +
+      'explicitly-requested reminders in extraActions.\n' +
+      '- Leave any field that does not apply to the chosen eventType as an empty string, ' +
+      'empty array, or null.',
     messages: [{ role: 'user', content: message }],
   });
 

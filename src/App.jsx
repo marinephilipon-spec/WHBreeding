@@ -2167,35 +2167,73 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
   // card and save handler expect — backfilling the horse from the conversation
   // fallback, validating categories, and computing the recurring-check count.
   const normalizeParsed = (p, text, fallbackHorse) => {
-    const validCategory = (c, dflt) => (ACTION_CATEGORIES.some(x => x.key === c) ? c : dflt);
     const horseId = p.horseId || fallbackHorse?.id || null;
     const horse = horses.find(h => h.id === horseId) || null;
+    const name = horse?.nickname || horse?.barnName || 'the mare';
 
-    let scheduleSeries = null;
-    if (p.scheduleSeries && p.scheduleSeries.intervalHours) {
-      const intervalHours = Math.max(1, Math.round(p.scheduleSeries.intervalHours));
-      const days = Math.max(1, Math.round(p.scheduleSeries.days || 3));
-      scheduleSeries = {
-        intervalHours,
-        days,
-        count: Math.max(1, Math.floor((days * 24) / intervalHours)),
-        label: p.scheduleSeries.label || 'Check',
-      };
+    // Trust only an event type the catalog knows; anything else is a plain note.
+    const eventType = EVENT_TYPES.some(t => t.key === p.eventType) ? p.eventType : 'note';
+
+    // Recurring-check series: backfill the count from interval + window so the
+    // monitoring branch of deriveEvent schedules the right number of reminders,
+    // exactly as the local parser does.
+    let series = null;
+    if (p.series && p.series.intervalHours) {
+      const intervalHours = Math.max(1, Math.round(p.series.intervalHours));
+      const days = Math.max(1, Math.round(p.series.days || 3));
+      series = { intervalHours, days, count: Math.max(1, Math.floor((days * 24) / intervalHours)) };
+    } else if (eventType === 'monitoring') {
+      series = { intervalHours: 12, days: 3, count: Math.max(1, Math.floor((3 * 24) / 12)) };
     }
 
-    return {
+    // Explicitly-requested extra reminders -> the same action shape deriveEvent
+    // emits, so they render in the preview and save identically.
+    const validPriority = (pr) => (['low', 'medium', 'high', 'critical'].includes(pr) ? pr : 'medium');
+    const extraActions = Array.isArray(p.extraActions)
+      ? p.extraActions
+          .filter(a => a && a.title)
+          .map(a => {
+            const label = cap(String(a.title).trim());
+            return {
+              label,
+              bullet: label,
+              title: `${label} - ${name}`,
+              dueDate: a.dueDate || today(),
+              dueTime: '',
+              priority: validPriority(a.priority),
+              category: 'check',
+            };
+          })
+      : [];
+
+    // Assemble the exact field set the local rule-based parser produces, then run
+    // it through the shared deriveEvent() factory. This is what makes the AI path
+    // and the offline fallback yield an identical confirmation card, save payload,
+    // and editable form — the AI only supplies smarter field extraction.
+    const fields = {
       horseId,
-      horseName: horse?.barnName || p.horseName || 'Unknown',
-      actionTakenCategory: validCategory(p.actionTakenCategory, 'check'),
-      actionTaken: p.actionTaken || '',
-      actionTakenDate: p.actionTakenDate || '',
-      actionRequiredCategory: validCategory(p.actionRequiredCategory, 'check'),
-      actionItem: p.actionItem || '',
-      dueDate: p.dueDate || '',
-      scheduleSeries,
-      breedingStatusUpdate: p.breedingStatusUpdate || '',
+      horseName: horse?.barnName || 'Unknown',
+      name,
+      eventType,
+      date: p.date || today(),
+      time: p.time || nowTime(),
+      semenType: eventType === 'insemination' ? (p.semenType || '') : '',
+      stallion: eventType === 'insemination' ? (p.stallion || '') : '',
+      follicleRight: (eventType === 'ultrasound' || eventType === 'monitoring') ? (p.follicleRight || '') : '',
+      follicleLeft: (eventType === 'ultrasound' || eventType === 'monitoring') ? (p.follicleLeft || '') : '',
+      dose: eventType === 'lutalyse' ? (p.dose || '') : '',
+      result: eventType === 'pregnancy-check' ? (p.result || '') : '',
+      series,
+      extraActions,
       note: p.note || text,
     };
+
+    // Still-open reminders this note reports as done, surfaced for confirm/deny —
+    // matched client-side against the live action list, just like the local path.
+    const resolvedActions = findResolvedActions(text, horseId, actions)
+      .map((a) => ({ id: a.id, title: a.title, confirmed: true }));
+
+    return { ...fields, ...deriveEvent(fields), resolvedActions };
   };
 
   // Ask Claude (via the Netlify AI Gateway function) to parse a free-form note
