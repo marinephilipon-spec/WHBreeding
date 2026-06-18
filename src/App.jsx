@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Home, Calendar as CalIcon, Heart, MessageSquare, Settings,
+  Calendar as CalIcon, Heart, MessageSquare, Home,
   ChevronRight, ChevronLeft, ChevronDown, Plus, Sparkles, Check, X,
   Trash2, Edit2, FileText,
 } from 'lucide-react';
+import logo from './assets/logo.png';
 
 // ============================================================================
 // DESIGN SYSTEM
@@ -64,6 +65,7 @@ const nowTime = () => {
 // what the editor's dropdown shows.
 const ACTION_CATEGORIES = [
   { key: 'check', label: 'Check' },
+  { key: 'palpation', label: 'Palpation Check' },
   { key: 'breed', label: 'Breed / Inseminate' },
   { key: 'drug', label: 'Administer Drug' },
   { key: 'short-cycle', label: 'Short Cycle' },
@@ -199,6 +201,95 @@ const parseRelativeDate = (lower) => {
   return null;
 };
 
+// Resolve a FUTURE day reference — "tomorrow", "in 3 days", "next week",
+// "on Tuesday", "next Friday", a bare upcoming weekday, or an explicit calendar
+// date that hasn't passed — into a local "YYYY-MM-DD" string. Returns null when
+// the text names no future day. This is the counterpart to parseRelativeDate
+// (which only resolves the past) and powers scheduling a reminder for something
+// the keeper plans to do, e.g. "check Iris on Tuesday morning".
+const parseFutureDate = (lower) => {
+  const base = new Date();
+  base.setHours(0, 0, 0, 0);
+
+  if (/\bday after tomorrow\b/.test(lower)) return formatDate(addDays(base, 2));
+  if (/\b(tomorrow|tmrw)\b/.test(lower)) return formatDate(addDays(base, 1));
+
+  // "in 3 days", "in two weeks", "in a month".
+  let m = lower.match(/\bin\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+(day|days|week|weeks|month|months)\b/);
+  if (m) {
+    const qty = parseCount(m[1]);
+    if (qty >= 1) {
+      const days = qty * (/week/.test(m[2]) ? 7 : /month/.test(m[2]) ? 30 : 1);
+      return formatDate(addDays(base, days));
+    }
+  }
+
+  if (/\bnext\s+week\b/.test(lower)) return formatDate(addDays(base, 7));
+
+  // "next Tuesday" / "on Tuesday" / "this Friday" / a bare weekday — the next
+  // upcoming occurrence of that weekday. Today's weekday resolves to a week out.
+  const dayNames = Object.keys(WEEKDAYS).join('|');
+  m = lower.match(new RegExp(`\\b(?:next|this|on|coming)?\\s*(${dayNames})\\b`, 'i'));
+  if (m) {
+    const target = WEEKDAYS[m[1].toLowerCase()];
+    let diff = target - base.getDay();
+    if (diff <= 0) diff += 7; // strictly upcoming
+    return formatDate(addDays(base, diff));
+  }
+
+  // An explicit calendar date that is today or later ("on May 28").
+  const exp = parseExplicitDate(lower);
+  if (exp && parseLocalDate(exp) >= base) return exp;
+
+  return null;
+};
+
+// A rough time-of-day from words ("Tuesday morning") when no clock time is
+// stated, so a scheduled reminder lands at a sensible hour. Returns '' if none.
+const parseTimeOfDay = (lower) => {
+  if (/\bmorning\b/.test(lower)) return '08:00';
+  if (/\b(afternoon|midday|noon)\b/.test(lower)) return '13:00';
+  if (/\b(evening|tonight)\b/.test(lower)) return '17:00';
+  if (/\bnight\b/.test(lower)) return '20:00';
+  return '';
+};
+
+// Past-tense verbs and time words that mark a message as a record of something
+// that already happened ("Checked Iris today", "bred her yesterday"), so it is
+// logged as an event rather than scheduled as a future reminder.
+const PAST_TENSE_RE = /\b(checked|rechecked|palped|palpated|bred|inseminated|covered|scanned|gave|administered|foaled|delivered|did|done|saw|seen|completed|flushed|teased|confirmed|examined|looked|monitored|noticed|found|gave)\b/;
+const PAST_TIME_RE = /\b(yesterday|yday|today|this\s+morning|this\s+afternoon|this\s+evening|tonight|just\s+now|earlier|ago)\b/;
+// Tokens that mean the message reports a finding (a measurement, a result, a
+// semen type) — i.e. it describes what happened and must be logged, even if it
+// also mentions a future follow-up.
+const REPORTING_CONTENT_RE = /\d+\s*mm\b|follicle|\b(positive|negative|in\s*foal|pregnant|embryo|heartbeat|open|reabsorb|miscarriage)\b|\b(fresh|frozen|chilled|cooled)\b/;
+
+// Decide whether a chat message is a future scheduling request ("check Iris on
+// Tuesday morning") rather than a log of something already done ("Checked Iris
+// today"). Conservative: any past-tense verb, past-time word, or reported
+// finding makes it a log; only a clean future-dated request schedules.
+const isSchedulingIntent = (lower) => {
+  if (PAST_TENSE_RE.test(lower)) return false;
+  if (PAST_TIME_RE.test(lower)) return false;
+  if (REPORTING_CONTENT_RE.test(lower)) return false;
+  return parseFutureDate(lower) != null;
+};
+
+// For a scheduling request, the reminder label and action category to use for a
+// given recognised event type. Defaults to a palpation check.
+const SCHEDULE_META = {
+  palpation: { label: 'Palpation Check', category: 'palpation' },
+  insemination: { label: 'Breeding', category: 'breed' },
+  ultrasound: { label: 'Ultrasound Check', category: 'check' },
+  'pregnancy-check': { label: 'Pregnancy Check', category: 'check' },
+  heartbeat: { label: 'Heartbeat Check', category: 'check' },
+  ovulation: { label: 'Ovulation Check', category: 'check' },
+  lutalyse: { label: 'Lutalyse', category: 'drug' },
+  monitoring: { label: 'Monitoring Check', category: 'check' },
+  foaled: { label: 'Foaling Watch', category: 'check' },
+  note: { label: 'Check', category: 'palpation' },
+};
+
 // Pull a time of day out of free-form text — "11am", "11:00", "2:30pm" — and
 // return it as a 24-hour "HH:MM" string, or '' when none is stated.
 const parseTime = (lower) => {
@@ -235,6 +326,10 @@ const classifyEventType = (lower) => {
   if (/ovulat/.test(lower)) return 'ovulation';
   if (/inseminat|\bbred\b|\bbreed\b|breeding|covered|live\s*cover|\bai\b/.test(lower)) return 'insemination';
   if (/ultra\s?sound|\bscan\b|follicle|\d+\s*(?:mm)?\s*(?:right|left)|(?:right|left)\s*\d+/.test(lower)) return 'ultrasound';
+  // A bare "check"/"palp" of a mare with no more specific subject means she was
+  // (or is to be) manually palpated — a routine repro exam — rather than a plain
+  // note. Kept last so the specific checks above always win.
+  if (/\bpalpat(?:e|ed|es|ing|ion)?\b|\bpalp(?:ed|ing|s)?\b|\bcheck(?:ed|ing|s)?\b|\brecheck(?:ed|ing)?\b|\bfelt\b/.test(lower)) return 'palpation';
   return 'note';
 };
 
@@ -307,6 +402,7 @@ const EVENT_TYPES = [
   { key: 'uterine-issue', label: 'uterine issue' },
   { key: 'pregnancy-loss', label: 'pregnancy loss' },
   { key: 'foaled', label: 'foaled out' },
+  { key: 'palpation', label: 'palpation check' },
   { key: 'note', label: 'note' },
 ];
 
@@ -453,6 +549,25 @@ const deriveEvent = (f) => {
   let actions = [];
   let status = '';
 
+  // A future scheduling request ("check Iris on Tuesday morning") creates a
+  // reminder for the planned day and no timeline event — nothing has happened
+  // yet, so there is nothing to record. The category/label come from whatever
+  // the message asked for (a bare check defaults to a palpation).
+  if (f.intent === 'schedule') {
+    const meta = SCHEDULE_META[f.eventType] || SCHEDULE_META.palpation;
+    const reminder = {
+      label: meta.label,
+      bullet: meta.label,
+      title: `${meta.label} - ${name}`,
+      dueDate: f.date || today(),
+      dueTime: f.time || '',
+      priority: 'medium',
+      category: meta.category,
+    };
+    const extra = Array.isArray(f.extraActions) ? f.extraActions : [];
+    return { eventTitle: '', eventDetails: details, actions: [reminder, ...extra], breedingStatusUpdate: '' };
+  }
+
   switch (f.eventType) {
     case 'insemination': {
       title = `${name} - Inseminated${f.semenType ? ` (${f.semenType})` : ''}${f.stallion ? ` - ${f.stallion}` : ''}`;
@@ -536,6 +651,10 @@ const deriveEvent = (f) => {
     case 'foaled': {
       title = `${name} - Foaled Out`;
       status = 'Foaled';
+      break;
+    }
+    case 'palpation': {
+      title = `${name} - Palpation Check`;
       break;
     }
     case 'ultrasound': {
@@ -754,7 +873,7 @@ const getFirstDayOfMonth = (date) => {
 // gets its own URL so links can be bookmarked, shared, and navigated with the
 // browser's back/forward buttons. A "/*  ->  /index.html" rewrite (netlify.toml)
 // means any of these paths loads the app, which then reads the path back.
-const VALID_TABS = ['home', 'horses', 'chat', 'calendar', 'settings'];
+const VALID_TABS = ['home', 'horses', 'chat', 'calendar'];
 
 const pathToRoute = (pathname) => {
   const parts = pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
@@ -788,6 +907,10 @@ const SAMPLE_ACTIONS = [];
 const styles = {
   page: { flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: DS.colors.bg },
   scrollable: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', paddingBottom: '20px' },
+  // Scroll area for the four tabbed screens, which sit beneath the fixed 80px
+  // BottomNav. The extra bottom padding (nav height + a gap + the device safe
+  // area) keeps the last card from scrolling underneath the nav bar.
+  scrollableNav: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', paddingBottom: 'calc(96px + env(safe-area-inset-bottom))' },
   contentPadding: { padding: `${DS.spacing.lg} ${DS.spacing.lg} ${DS.spacing.xl}` },
   header: { paddingTop: '24px', paddingBottom: DS.spacing.lg, paddingLeft: DS.spacing.lg, paddingRight: DS.spacing.lg, borderBottom: `1px solid ${DS.colors.border}`, background: DS.colors.white, display: 'flex', alignItems: 'center', gap: DS.spacing.lg },
   card: { background: DS.colors.white, border: `1px solid ${DS.colors.border}`, borderRadius: DS.radius.lg, padding: DS.spacing.lg, boxShadow: DS.shadow.xs, marginBottom: DS.spacing.lg },
@@ -800,20 +923,27 @@ const styles = {
   body: { fontSize: DS.typography.size.base, color: DS.colors.text },
   bodySmall: { fontSize: DS.typography.size.sm, color: DS.colors.textSecondary },
   label: { fontSize: DS.typography.size.sm, fontWeight: DS.typography.weight.semibold, color: DS.colors.textSecondary, textTransform: 'uppercase', letterSpacing: '0.05em' },
-  input: { width: '100%', padding: `${DS.spacing.md} ${DS.spacing.lg}`, fontSize: DS.typography.size.base, border: `1px solid ${DS.colors.border}`, borderRadius: DS.radius.md, background: DS.colors.bgAlt, color: DS.colors.text, fontFamily: DS.typography.family.base, minHeight: '44px' },
+  input: { width: '100%', maxWidth: '100%', boxSizing: 'border-box', padding: `${DS.spacing.md} ${DS.spacing.lg}`, fontSize: DS.typography.size.base, border: `1px solid ${DS.colors.border}`, borderRadius: DS.radius.md, background: DS.colors.bgAlt, color: DS.colors.text, fontFamily: DS.typography.family.base, minHeight: '44px' },
 };
 
 // ============================================================================
 // HEADER COMPONENT
 // ============================================================================
 
-function Header({ title, subtitle, onBack, action }) {
+function Header({ title, subtitle, onBack, action, logo: showLogo }) {
   return (
     <div style={styles.header}>
       {onBack && (
         <button onClick={onBack} style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.md, fontSize: '24px', display: 'flex', alignItems: 'center' }}>
           ←
         </button>
+      )}
+      {showLogo && (
+        <img
+          src={logo}
+          alt="White Horse Estate"
+          style={{ width: '56px', height: '56px', objectFit: 'contain', flexShrink: 0 }}
+        />
       )}
       <div style={{ flex: 1 }}>
         {subtitle && <div style={styles.label}>{subtitle}</div>}
@@ -1247,7 +1377,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   if (isEditing) {
     return (
       <div style={styles.page}>
-        <Header title={`Edit ${horse.barnName}`} subtitle="EDIT PROFILE" onBack={() => setIsEditing(false)} />
+        <Header title={`Edit ${horse.nickname || horse.barnName}`} subtitle="EDIT PROFILE" onBack={() => setIsEditing(false)} />
         <div style={styles.scrollable}>
           <div style={styles.contentPadding}>
             <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
@@ -1274,7 +1404,6 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
     return n >= 0 ? n : null;
   };
   const statCardBase = { flex: '1 1 140px', minWidth: '128px', background: DS.colors.white, border: `1px solid ${DS.colors.border}`, borderRadius: DS.radius.lg, padding: DS.spacing.lg, boxShadow: DS.shadow.xs };
-  const PRIORITY_BADGE = { critical: { label: 'CRIT', bg: DS.colors.error }, high: { label: 'HIGH', bg: DS.colors.status.waiting }, medium: { label: 'MED', bg: DS.colors.primary }, low: { label: 'LOW', bg: DS.colors.textMuted } };
   const shortDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   const longDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   const mediumDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -1307,7 +1436,7 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
             onClick={(e) => e.stopPropagation()}
             style={{ background: DS.colors.white, borderRadius: DS.radius.lg, padding: DS.spacing.xl, maxWidth: '420px', width: '100%', boxShadow: DS.shadow.md }}
           >
-            <h2 style={styles.h2}>Delete {horse.barnName}?</h2>
+            <h2 style={styles.h2}>Delete {horse.nickname || horse.barnName}?</h2>
             <p style={{...styles.body, color: DS.colors.textSecondary, marginBottom: DS.spacing.xl}}>
               This permanently removes this horse and its profile. This action cannot be undone.
             </p>
@@ -1609,7 +1738,6 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                 </div>
               ) : (
                 horseActions.map(action => {
-                  const badge = action.priority ? PRIORITY_BADGE[action.priority] : null;
                   return (
                   <div key={action.id} style={{...styles.card, marginLeft: 0, marginRight: 0, opacity: action.done ? 0.6 : 1, background: action.done ? DS.colors.bgAlt : DS.colors.white}}>
                     {editingItemId === action.id ? renderItemEditor('action') : (
@@ -1621,9 +1749,6 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
                         <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>Due: {mediumDate(action.dueDate)}</p>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, flexShrink: 0 }}>
-                        {badge && (
-                          <span style={{ background: badge.bg, color: 'white', borderRadius: DS.radius.sm, padding: '3px 8px', fontSize: DS.typography.size.xs, fontWeight: DS.typography.weight.bold, letterSpacing: '0.04em' }}>{badge.label}</span>
-                        )}
                         <button onClick={() => startEditItem('action', action)} style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Edit"><Edit2 size={16} /></button>
                         <button onClick={() => onDeleteAction(action.id)} style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Delete"><Trash2 size={16} /></button>
                       </div>
@@ -1793,10 +1918,17 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
 // HOME SCREEN
 // ============================================================================
 
-function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggleAction, onDeleteAction, onEditAction }) {
+function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggleAction, onDeleteAction, onEditAction, onAddAction }) {
   const [editingAction, setEditingAction] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [actionFilter, setActionFilter] = useState('all');
+  // Manual "Add Action" form on the home screen. The single "Action" dropdown is
+  // driven by the shared action categories: picking one sets both the saved
+  // category (its key) and the action title (its label) automatically, so there
+  // is no separate category field to keep in sync.
+  const emptyNewAction = { horseId: '', category: ACTION_CATEGORIES[0].key, title: ACTION_CATEGORIES[0].label, dueDate: today(), note: '' };
+  const [showAddAction, setShowAddAction] = useState(false);
+  const [newAction, setNewAction] = useState(emptyNewAction);
   // Which home sections are collapsed. Persisted to localStorage so the choice
   // survives refreshes.
   const [collapsed, setCollapsed] = useState(() => {
@@ -1814,8 +1946,14 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
     });
   };
 
-  const breedingMares = horses.filter(h => h.type === 'mare' && h.onBreedingList);
-  const pendingActions = actions.filter(a => !a.done);
+  const breedingMares = horses
+    .filter(h => h.type === 'mare' && h.onBreedingList)
+    .sort((a, b) => (a.nickname || a.barnName || '').localeCompare(b.nickname || b.barnName || ''));
+  // Outstanding reminders, ordered from the next one due to the furthest away so
+  // the most urgent work is always at the top.
+  const pendingActions = actions
+    .filter(a => !a.done)
+    .sort((a, b) => parseLocalDate(a.dueDate) - parseLocalDate(b.dueDate));
 
   // Tabbed views over the pending reminders, mirroring the Horses page tabs.
   // "Today" is due exactly today; "This Week" is due within the next 7 days
@@ -1842,11 +1980,31 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
     setEditingAction(null);
   };
 
+  // Mares to choose from, alphabetical, for the manual action form.
+  const mareOptions = horses
+    .filter(h => h.type === 'mare')
+    .sort((a, b) => (a.nickname || a.barnName || '').localeCompare(b.nickname || b.barnName || ''));
+
+  const submitNewAction = () => {
+    if (!newAction.title.trim()) return;
+    onAddAction({
+      id: `a${Date.now()}`,
+      horseId: newAction.horseId || null,
+      category: newAction.category,
+      title: newAction.title.trim(),
+      note: newAction.note.trim(),
+      dueDate: newAction.dueDate || today(),
+      done: false,
+    });
+    setNewAction(emptyNewAction);
+    setShowAddAction(false);
+  };
+
   return (
     <div style={styles.page}>
-      <Header title="Breeding Log" subtitle="White Horse Estate" />
+      <Header title="Breeding Log" subtitle="White Horse Estate" logo />
 
-      <div style={styles.scrollable}>
+      <div style={styles.scrollableNav}>
         <div style={styles.contentPadding}>
           {/* Chat CTA Banner */}
           <div 
@@ -1904,7 +2062,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
                 <div key={mare.id} style={{...styles.card, marginLeft: 0, marginRight: 0, cursor: 'pointer'}} onClick={() => onSelectHorse(mare.id)}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: DS.spacing.md }}>
                     <div style={{ flex: 1 }}>
-                      <h3 style={styles.h3}>{mare.barnName}</h3>
+                      <h3 style={styles.h3}>{mare.nickname || mare.barnName}</h3>
                       <p style={styles.bodySmall}>{mare.breed} • {calculateAge(mare.yob)} years old</p>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.md, flexShrink: 0 }}>
@@ -1933,6 +2091,70 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
             </h2>
 
             {!collapsed.actions && (<>
+            {/* Add Action — manual entry with the same fields as the chat */}
+            <button
+              onClick={() => setShowAddAction(v => !v)}
+              style={{...styles.buttonBase, ...styles.buttonSecondary, width: '100%', marginBottom: DS.spacing.lg, justifyContent: 'center'}}
+            >
+              {showAddAction ? <><X size={18} /> Close</> : <><Plus size={18} /> Add Action</>}
+            </button>
+
+            {showAddAction && (
+              <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+                <div>
+                  <label style={styles.label}>Mare</label>
+                  <select
+                    value={newAction.horseId}
+                    onChange={(e) => setNewAction({...newAction, horseId: e.target.value})}
+                    style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                  >
+                    <option value="">No mare</option>
+                    {mareOptions.map(h => (<option key={h.id} value={h.id}>{h.nickname || h.barnName}</option>))}
+                  </select>
+                </div>
+
+                <div style={{ marginTop: DS.spacing.lg }}>
+                  <label style={styles.label}>Action</label>
+                  <select
+                    value={newAction.category}
+                    onChange={(e) => {
+                      const cat = ACTION_CATEGORIES.find(c => c.key === e.target.value);
+                      setNewAction({ ...newAction, category: cat.key, title: cat.label });
+                    }}
+                    style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                  >
+                    {ACTION_CATEGORIES.map(c => (<option key={c.key} value={c.key}>{c.label}</option>))}
+                  </select>
+                </div>
+
+                <div style={{ marginTop: DS.spacing.lg }}>
+                  <label style={styles.label}>Due Date</label>
+                  <input
+                    type="date"
+                    value={newAction.dueDate}
+                    onChange={(e) => setNewAction({...newAction, dueDate: e.target.value})}
+                    style={{...styles.input, marginTop: DS.spacing.sm}}
+                  />
+                </div>
+
+                <div style={{ marginTop: DS.spacing.lg }}>
+                  <label style={styles.label}>Note</label>
+                  <input
+                    type="text"
+                    value={newAction.note}
+                    onChange={(e) => setNewAction({...newAction, note: e.target.value})}
+                    placeholder="Optional details"
+                    style={{...styles.input, marginTop: DS.spacing.sm}}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', gap: DS.spacing.md, marginTop: DS.spacing.lg }}>
+                  <button onClick={submitNewAction} disabled={!newAction.title.trim()} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1, opacity: newAction.title.trim() ? 1 : 0.6}}>Save Action</button>
+                  <button onClick={() => { setShowAddAction(false); setNewAction(emptyNewAction); }} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
+                </div>
+              </div>
+            )}
+
             {/* Tabs: All / Today / This Week */}
             <div style={{ display: 'flex', gap: DS.spacing.sm, marginBottom: DS.spacing.lg, overflowX: 'auto', paddingBottom: DS.spacing.xs }}>
               {actionTabs.map(tab => (
@@ -2002,7 +2224,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
                         <div style={{ flex: 1 }}>
                           <h3 style={styles.h3}>{getActionTitleWithMareName(action, horses)}</h3>
                           {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{action.note}</p>}
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>Due: {relativeDate(action.dueDate)}</p>
+                          <span style={{ display: 'inline-block', marginTop: DS.spacing.sm, padding: `${DS.spacing.xs} ${DS.spacing.md}`, background: DS.colors.primaryVeryLight, color: DS.colors.primary, borderRadius: DS.radius.full, fontSize: DS.typography.size.sm, fontWeight: DS.typography.weight.semibold, whiteSpace: 'nowrap' }}>{relativeDate(action.dueDate)}</span>
                         </div>
                         <div style={{ display: 'flex', gap: DS.spacing.sm, flexShrink: 0 }}>
                           <button
@@ -2038,9 +2260,14 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
 // CHAT SCREEN
 // ============================================================================
 
+// Temporarily hides the "Ask Questions" chat mode. The ask-question code path is
+// kept intact below — flip this back to true to re-enable the feature.
+const ENABLE_ASK_QUESTIONS = false;
+
 function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, onUpdateBreedingStatus, onResolveActions }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
+  const [inputFocused, setInputFocused] = useState(false);
   const [editingConfirmation, setEditingConfirmation] = useState(null);
   const [chatMode, setChatMode] = useState('log'); // 'log' or 'ask'
 
@@ -2055,22 +2282,40 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
   const parseInput = (text, fallbackHorse = null) => {
     const lower = text.toLowerCase();
 
-    // Identify which horse the message is about. If the message names no horse
-    // (e.g. a follow-up "remind me at day 28"), fall back to the horse the
-    // conversation was already about.
-    const horseMatches = horses.map(h => h.barnName.toLowerCase()).join('|');
+    // Identify which horse the message is about, matching either her barn name
+    // (nickname) or her registered name — so a note that uses the barn name the
+    // keeper actually says in the barn ("bred Roma") is recognised, not just the
+    // registered name. If the message names no horse (e.g. a follow-up "remind me
+    // at day 28"), fall back to the horse the conversation was already about.
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nameForms = horses
+      .flatMap(h => [h.nickname, h.barnName].filter(Boolean).map(n => ({ name: n.toLowerCase(), horse: h })))
+      // Longest names first so a longer name wins over a shorter overlapping one.
+      .sort((a, b) => b.name.length - a.name.length);
+    const horseMatches = nameForms.map(f => escapeRe(f.name)).join('|');
     const horseMatch = horseMatches ? text.match(new RegExp(`(${horseMatches})`, 'i')) : null;
-    const horse = horseMatch
-      ? horses.find(h => h.barnName.toLowerCase() === horseMatch[0].toLowerCase())
+    const matchedName = horseMatch ? horseMatch[0].toLowerCase() : null;
+    const horse = matchedName
+      ? (nameForms.find(f => f.name === matchedName)?.horse || fallbackHorse)
       : fallbackHorse;
     const name = horse?.nickname || horse?.barnName || 'the mare';
+
+    // Whether this message schedules something for the future ("check Iris on
+    // Tuesday") versus records something already done ("Checked Iris today").
+    const scheduling = isSchedulingIntent(lower);
 
     // When the event happened (a relative reference like "yesterday" wins over an
     // explicit calendar date), defaulting to today, and the time of day. When the
     // note doesn't state a time, fall back to the moment the update is logged so
-    // the event is stamped with a real time rather than left blank.
-    const date = parseRelativeDate(lower) || parseExplicitDate(text) || today();
-    const time = parseTime(lower) || nowTime();
+    // the event is stamped with a real time rather than left blank. For a future
+    // request the date is the planned day and the time is left to whatever the
+    // message states (clock time or a "morning"/"afternoon" hint), not "now".
+    const date = scheduling
+      ? (parseFutureDate(lower) || today())
+      : (parseRelativeDate(lower) || parseExplicitDate(text) || today());
+    const time = scheduling
+      ? (parseTime(lower) || parseTimeOfDay(lower))
+      : (parseTime(lower) || nowTime());
 
     const eventType = classifyEventType(lower);
 
@@ -2109,9 +2354,10 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
 
     const fields = {
       horseId: horse?.id || null,
-      horseName: horse?.barnName || 'Unknown',
+      horseName: horse?.nickname || horse?.barnName || 'Unknown',
       name,
       eventType,
+      intent: scheduling ? 'schedule' : 'log',
       date,
       time,
       semenType: eventType === 'insemination' ? semenRaw : '',
@@ -2143,7 +2389,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     const next = {
       ...f,
       name: horse?.nickname || horse?.barnName || f.name || 'Unknown',
-      horseName: horse?.barnName || f.horseName || 'Unknown',
+      horseName: horse?.nickname || horse?.barnName || f.horseName || 'Unknown',
     };
     // Re-match resolved reminders against the (possibly edited) mare/note so the
     // preview never offers to close out another mare's actions after an edit,
@@ -2212,7 +2458,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     // and editable form — the AI only supplies smarter field extraction.
     const fields = {
       horseId,
-      horseName: horse?.barnName || 'Unknown',
+      horseName: horse?.nickname || horse?.barnName || 'Unknown',
       name,
       eventType,
       date: p.date || today(),
@@ -2354,18 +2600,21 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
 
     // The logged event itself goes on the mare's timeline. The detail string keeps
     // the semen/stallion/follicle/result wording so the profile's breeding summary
-    // and foaling timeline can read it back.
-    onAddEvent({
-      id: `e${base}`,
-      horseId: confirmData.horseId,
-      date: confirmData.date,
-      time: confirmData.time || '',
-      type: confirmData.eventType,
-      title: confirmData.eventTitle,
-      detail: buildEventDetail(confirmData),
-      note: confirmData.note || '',
-    });
-    created.push('event');
+    // and foaling timeline can read it back. A pure future scheduling request has
+    // no event (nothing happened yet) — only the reminder below is created.
+    if (confirmData.eventTitle) {
+      onAddEvent({
+        id: `e${base}`,
+        horseId: confirmData.horseId,
+        date: confirmData.date,
+        time: confirmData.time || '',
+        type: confirmData.eventType,
+        title: confirmData.eventTitle,
+        detail: buildEventDetail(confirmData),
+        note: confirmData.note || '',
+      });
+      created.push('event');
+    }
 
     // Each derived follow-up becomes a scheduled action with its priority. An
     // intensive-monitoring series expands into one reminder per interval across
@@ -2456,6 +2705,22 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     }));
   };
 
+  // Drop one of the auto-created actions from a pending confirmation card, so a
+  // suggestion the keeper doesn't want is never saved — without having to edit
+  // or cancel the whole card.
+  const removeConfirmationAction = (confirmData, idx) => {
+    setMessages(messages.map(m => {
+      if (m.confirmData?.id !== confirmData.id) return m;
+      return {
+        ...m,
+        confirmData: {
+          ...m.confirmData,
+          actions: (m.confirmData.actions || []).filter((_, i) => i !== idx),
+        },
+      };
+    }));
+  };
+
   const handleSaveEdit = () => {
     if (editingConfirmation) {
       const recomputed = recomputeConfirmation(editingConfirmation);
@@ -2481,14 +2746,14 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
         })),
         actions: actions.map(a => ({
           title: a.title,
-          horseName: horses.find(h => h.id === a.horseId)?.nickname || 'Unknown',
+          horseName: (() => { const h = horses.find(h => h.id === a.horseId); return h ? (h.nickname || h.barnName) : 'Unknown'; })(),
           dueDate: a.dueDate,
           done: a.done,
           note: a.note,
         })),
         events: events.map(e => ({
           title: e.title,
-          horseName: horses.find(h => h.id === e.horseId)?.nickname || 'Unknown',
+          horseName: (() => { const h = horses.find(h => h.id === e.horseId); return h ? (h.nickname || h.barnName) : 'Unknown'; })(),
           date: e.date,
         })),
       };
@@ -2518,6 +2783,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
       <Header title="Breeding Log Chat" subtitle="AI-Powered" onBack={onBack} />
 
       {/* Chat Mode Toggle */}
+      {ENABLE_ASK_QUESTIONS && (
       <div style={{ padding: `${DS.spacing.md} ${DS.spacing.lg}`, background: DS.colors.white, borderBottom: `1px solid ${DS.colors.border}`, display: 'flex', gap: DS.spacing.md }}>
         <button
           onClick={() => { setChatMode('log'); setMessages([]); }}
@@ -2554,6 +2820,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
           💬 Ask Questions
         </button>
       </div>
+      )}
 
       <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', paddingBottom: '180px' }}>
         {messages.length === 0 ? (
@@ -2591,29 +2858,40 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
                     }}>
                       <h3 style={{...styles.h3, marginBottom: DS.spacing.lg}}>📋 This will create:</h3>
 
-                      {/* EVENT */}
-                      <div style={styles.label}>Event</div>
-                      <div style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm }}>
-                        <p style={{...styles.body, fontWeight: DS.typography.weight.bold}}>{msg.confirmData.eventTitle}</p>
-                        {(msg.confirmData.eventDetails || []).map(d => (
-                          <p key={d.label} style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
-                            {d.label}: <strong style={{ color: DS.colors.text }}>{d.value}</strong>
-                          </p>
-                        ))}
-                      </div>
+                      {/* EVENT — omitted for a pure scheduling request, which
+                          only creates a future reminder and records nothing. */}
+                      {msg.confirmData.eventTitle && (<>
+                        <div style={styles.label}>Event</div>
+                        <div style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm }}>
+                          <p style={{...styles.body, fontWeight: DS.typography.weight.bold}}>{msg.confirmData.eventTitle}</p>
+                          {(msg.confirmData.eventDetails || []).map(d => (
+                            <p key={d.label} style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
+                              {d.label}: <strong style={{ color: DS.colors.text }}>{d.value}</strong>
+                            </p>
+                          ))}
+                        </div>
+                      </>)}
 
                       {/* AUTO-CREATED ACTIONS */}
                       {(msg.confirmData.actions || []).length > 0 && (
                         <div style={{ marginTop: DS.spacing.lg, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
-                          <div style={styles.label}>Auto-Created Actions</div>
+                          <div style={styles.label}>{msg.confirmData.eventTitle ? 'Auto-Created Actions' : 'Reminder to Schedule'}</div>
                           {msg.confirmData.actions.map((a, idx) => (
-                            <div key={idx} style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm }}>
-                              <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>{idx + 1}. {a.label}</p>
-                              <p style={{...styles.body, fontWeight: DS.typography.weight.bold, marginTop: DS.spacing.xs}}>{a.title}</p>
-                              <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
-                                Due: <strong style={{ color: DS.colors.text }}>{a.series ? `every ${a.series.intervalHours}h` : (a.dueTime ? `${a.dueDate} ${a.dueTime}` : a.dueDate)}</strong>
-                                {a.priority ? <> | Priority: <strong style={{ color: DS.colors.text }}>{a.priority.toUpperCase()}</strong></> : null}
-                              </p>
+                            <div key={idx} style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm, display: 'flex', alignItems: 'flex-start', gap: DS.spacing.md }}>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>{idx + 1}. {a.label}</p>
+                                <p style={{...styles.body, fontWeight: DS.typography.weight.bold, marginTop: DS.spacing.xs}}>{a.title}</p>
+                                <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
+                                  Due: <strong style={{ color: DS.colors.text }}>{a.series ? `every ${a.series.intervalHours}h` : (a.dueTime ? `${a.dueDate} ${a.dueTime}` : a.dueDate)}</strong>
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => removeConfirmationAction(msg.confirmData, idx)}
+                                style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center', flexShrink: 0 }}
+                                title="Remove this action"
+                              >
+                                <Trash2 size={18} />
+                              </button>
                             </div>
                           ))}
                         </div>
@@ -2754,7 +3032,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
                   style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
                 >
                   <option value="">Unknown</option>
-                  {horses.map(h => (<option key={h.id} value={h.id}>{h.barnName}</option>))}
+                  {horses.map(h => (<option key={h.id} value={h.id}>{h.nickname || h.barnName}</option>))}
                 </select>
               </div>
 
@@ -2921,13 +3199,15 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 handleSend();
               }
             }}
-            placeholder="What happened? (e.g., 'Bred Roma to Vitalis on May 28th, check pregnancy at day 28')"
+            placeholder={inputFocused ? '' : 'What happened today? (e.g. Bred Thelma today, check again in 2 weeks)'}
             style={{...styles.input, flex: 1, minHeight: '44px', maxHeight: '100px', resize: 'none', borderColor: input ? DS.colors.primary : DS.colors.border}}
           />
           <button onClick={handleSend} style={{...styles.buttonBase, ...styles.buttonPrimary, width: '44px', height: '44px', padding: 0, minWidth: 'auto', flexShrink: 0}}>
@@ -2973,7 +3253,8 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
     setShowAddForm(false);
   };
 
-  const mares = horses.filter(h => h.type === 'mare');
+  const byName = (a, b) => (a.nickname || a.barnName || '').localeCompare(b.nickname || b.barnName || '');
+  const mares = horses.filter(h => h.type === 'mare').sort(byName);
   const foals = horses.filter(h => h.type === 'foal');
   const foalsDue = horses.filter(h => h.type === 'mare' && h.foalDueDate);
 
@@ -3009,7 +3290,7 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
     <div style={styles.page}>
       <Header title={`Horses (${filteredHorses.length})`} subtitle="All Horses" action={<button onClick={() => setShowAddForm(!showAddForm)} style={{...styles.buttonBase, ...styles.buttonPrimary, padding: `${DS.spacing.md} ${DS.spacing.lg}`}}><Plus size={20} /> Add</button>} />
 
-      <div style={styles.scrollable}>
+      <div style={styles.scrollableNav}>
         <div style={styles.contentPadding}>
           {/* Search */}
           <div style={{ marginBottom: DS.spacing.lg, position: 'relative' }}>
@@ -3200,17 +3481,24 @@ function HorsesScreen({ horses, onSelectHorse, onAddHorse, flash }) {
               <div key={horse.id} onClick={() => onSelectHorse(horse.id)} style={{...styles.card, marginLeft: 0, marginRight: 0, cursor: 'pointer'}}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
                   <div>
-                    <h3 style={styles.h3}>{horse.barnName}</h3>
+                    <h3 style={styles.h3}>{horse.nickname || horse.barnName}</h3>
                     {horse.nickname && horse.nickname !== horse.barnName && (
-                      <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>Barn name: {horse.nickname}</p>
+                      <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>Registered: {horse.barnName}</p>
                     )}
                     <p style={styles.bodySmall}>{horse.breed} • {horse.type === 'foal' ? `Born ${horse.yob}` : `${calculateAge(horse.yob)} years old`}</p>
                   </div>
-                  {horse.status && (
-                    <span style={{ flexShrink: 0, fontSize: DS.typography.size.xs, fontWeight: DS.typography.weight.semibold, color: 'white', background: getHorseStatusColor(horse.status), padding: `${DS.spacing.xs} ${DS.spacing.md}`, borderRadius: DS.radius.full, whiteSpace: 'nowrap' }}>
-                      {horse.status}
-                    </span>
-                  )}
+                  {(() => {
+                    // Mares show their breeding-cycle status (the same pill the
+                    // home screen uses); other horses keep their lifecycle status.
+                    const isMare = horse.type === 'mare';
+                    const pillLabel = isMare ? horse.breedingStatus : horse.status;
+                    const pillColor = isMare ? getStatusColor(horse.breedingStatus) : getHorseStatusColor(horse.status);
+                    return pillLabel ? (
+                      <span style={{ flexShrink: 0, fontSize: DS.typography.size.xs, fontWeight: DS.typography.weight.semibold, color: 'white', background: pillColor, padding: `${DS.spacing.xs} ${DS.spacing.md}`, borderRadius: DS.radius.full, whiteSpace: 'nowrap' }}>
+                        {pillLabel}
+                      </span>
+                    ) : null;
+                  })()}
                 </div>
               </div>
             ))
@@ -3319,7 +3607,7 @@ function CalendarScreen({ actions, events = [], horses }) {
     <div style={styles.page}>
       <Header title="Calendar" subtitle="Schedule" />
 
-      <div style={styles.scrollable}>
+      <div style={styles.scrollableNav}>
         <div style={styles.contentPadding}>
           {/* View Mode Buttons */}
           <div style={{ display: 'flex', gap: DS.spacing.md, marginBottom: DS.spacing.xl, marginLeft: 0, marginRight: 0 }}>
@@ -3523,13 +3811,24 @@ function CalendarScreen({ actions, events = [], horses }) {
                         minHeight: '72px',
                         textAlign: 'left',
                         color: day ? DS.colors.text : DS.colors.textMuted,
-                        borderRadius: isToday ? DS.radius.md : '0',
                         overflow: 'hidden',
                       }}
                     >
                       {day && (
                         <>
-                          <div style={{ fontSize: DS.typography.size.base, fontWeight: isToday ? DS.typography.weight.bold : DS.typography.weight.normal, marginBottom: DS.spacing.sm }}>
+                          <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            width: '24px',
+                            height: '24px',
+                            marginBottom: DS.spacing.xs,
+                            borderRadius: '50%',
+                            background: isToday ? DS.colors.primary : 'transparent',
+                            color: isToday ? 'white' : DS.colors.text,
+                            fontSize: DS.typography.size.base,
+                            fontWeight: isToday ? DS.typography.weight.bold : DS.typography.weight.normal,
+                          }}>
                             {day}
                           </div>
                           <div style={{ maxHeight: '60px', overflowY: 'hidden' }}>
@@ -3538,17 +3837,19 @@ function CalendarScreen({ actions, events = [], horses }) {
                                 key={action.id}
                                 onClick={() => setSelectedEvent(action)}
                                 style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
                                   background: DS.colors.primary,
                                   color: 'white',
-                                  padding: `${DS.spacing.xs} ${DS.spacing.sm}`,
+                                  padding: `0 ${DS.spacing.sm}`,
                                   borderRadius: DS.radius.sm,
                                   fontSize: DS.typography.size.xs,
+                                  fontWeight: DS.typography.weight.semibold,
                                   marginBottom: DS.spacing.xs,
                                   overflow: 'hidden',
                                   textOverflow: 'ellipsis',
                                   whiteSpace: 'nowrap',
                                   height: '20px',
-                                  lineHeight: '20px',
                                   cursor: 'pointer',
                                   transition: 'all 0.2s ease',
                                 }}
@@ -3556,7 +3857,9 @@ function CalendarScreen({ actions, events = [], horses }) {
                                 onMouseEnter={(e) => e.currentTarget.style.opacity = '0.8'}
                                 onMouseLeave={(e) => e.currentTarget.style.opacity = '1'}
                               >
-                                {getActionTitleWithMareName(action, horses)}
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {getActionTitleWithMareName(action, horses)}
+                                </span>
                               </div>
                             ))}
                             {dayEvents.map(event => (
@@ -3622,19 +3925,10 @@ function CalendarScreen({ actions, events = [], horses }) {
                   </div>
                 )}
 
-                <div style={{ marginBottom: (selectedEvent.dueDate && selectedEvent.priority) ? DS.spacing.md : 0 }}>
+                <div style={{ marginBottom: 0 }}>
                   <div style={styles.label}>{selectedEvent.dueDate ? 'Due Date' : 'Date Taken'}</div>
                   <p style={{...styles.body, marginTop: DS.spacing.sm}}>{relativeDate(selectedEvent.dueDate || selectedEvent.date)}</p>
                 </div>
-
-                {selectedEvent.dueDate && selectedEvent.priority && (
-                  <div>
-                    <div style={styles.label}>Priority</div>
-                    <p style={{...styles.body, marginTop: DS.spacing.sm, textTransform: 'capitalize', color: selectedEvent.priority === 'high' ? DS.colors.error : selectedEvent.priority === 'medium' ? DS.colors.gold : DS.colors.success}}>
-                      {selectedEvent.priority}
-                    </p>
-                  </div>
-                )}
               </div>
 
               <button onClick={() => setSelectedEvent(null)} style={{...styles.buttonBase, ...styles.buttonSecondary, width: '100%'}}>
@@ -3642,31 +3936,6 @@ function CalendarScreen({ actions, events = [], horses }) {
               </button>
             </div>
           )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// SETTINGS SCREEN
-// ============================================================================
-
-function SettingsScreen() {
-  return (
-    <div style={styles.page}>
-      <Header title="Settings" subtitle="Farm Profile" />
-
-      <div style={styles.scrollable}>
-        <div style={styles.contentPadding}>
-          <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-            <h3 style={styles.h3}>White Horse Estate</h3>
-            <p style={styles.bodySmall}>Breeding Farm</p>
-            <div style={{ marginTop: DS.spacing.lg }}>
-              <div style={styles.label}>Farm Manager</div>
-              <p style={{...styles.body, marginTop: DS.spacing.sm}}>Sarah Hartwell</p>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -3683,7 +3952,6 @@ function BottomNav({ activeTab, onChange }) {
     { id: 'horses', label: 'Horses', icon: Heart },
     { id: 'chat', label: 'Chat', icon: MessageSquare },
     { id: 'calendar', label: 'Calendar', icon: CalIcon },
-    { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
   return (
@@ -3724,7 +3992,15 @@ function BottomNav({ activeTab, onChange }) {
               justifyContent: 'center',
             }}
           >
-            <Icon size={24} strokeWidth={active ? 2 : 1.5} />
+            {tab.img ? (
+              <img
+                src={tab.img}
+                alt={tab.label}
+                style={{ width: 24, height: 24, objectFit: 'contain', opacity: active ? 1 : 0.5 }}
+              />
+            ) : (
+              <Icon size={24} strokeWidth={active ? 2 : 1.5} />
+            )}
             <span>{tab.label}</span>
           </button>
         );
@@ -3864,7 +4140,7 @@ export default function App() {
     };
     setHorses([...horses, newHorse]);
     persistItem('horses', newHorse);
-    flash(`${newHorse.barnName} added!`);
+    flash(`${newHorse.nickname || newHorse.barnName} added!`);
   };
 
   const handleSelectHorse = (horseId) => {
@@ -3908,7 +4184,7 @@ export default function App() {
     }
 
     const horse = updateHorse(horseId, changes);
-    if (horse) flash(`${horse.barnName} status updated`);
+    if (horse) flash(`${horse.nickname || horse.barnName} status updated`);
   };
 
   const handleUpdateStallion = (horseId, stallion) => {
@@ -3917,7 +4193,7 @@ export default function App() {
 
   const handleToggleBreedingList = (horseId, onList) => {
     const horse = updateHorse(horseId, { onBreedingList: onList });
-    if (horse) flash(onList ? `${horse.barnName} added to breeding list` : `${horse.barnName} removed from breeding list`);
+    if (horse) flash(onList ? `${horse.nickname || horse.barnName} added to breeding list` : `${horse.nickname || horse.barnName} removed from breeding list`);
   };
 
   const handleUpdateHorse = (horseId, updatedData) => {
@@ -3926,7 +4202,7 @@ export default function App() {
 
   const handleUpdateHorseStatus = (horseId, status) => {
     const horse = updateHorse(horseId, { status });
-    if (horse) flash(`${horse.barnName} marked "${status}"`);
+    if (horse) flash(`${horse.nickname || horse.barnName} marked "${status}"`);
   };
 
   const handleDeleteHorse = (horseId) => {
@@ -3934,7 +4210,7 @@ export default function App() {
     setHorses(horses.filter(h => h.id !== horseId));
     removeItem('horses', horseId);
     navigate('horses');
-    if (horse) flash(`${horse.barnName} deleted`);
+    if (horse) flash(`${horse.nickname || horse.barnName} deleted`);
   };
 
   const handleToggleAction = (actionId) => {
@@ -3970,6 +4246,14 @@ export default function App() {
     setActions(actions.map(a => a.id === actionId ? updatedAction : a));
     persistItem('actions', updatedAction);
     flash('Action updated');
+  };
+
+  // Add a single action created by hand from the Home screen's "Add Action"
+  // form. Mirrors the shape the chat produces so it shows up in the same lists.
+  const handleAddAction = (action) => {
+    setActions(prev => [...prev, action]);
+    persistItem('actions', action);
+    flash('Action added!');
   };
 
   const handleDeleteEvent = (eventId) => {
@@ -4055,6 +4339,7 @@ export default function App() {
           onToggleAction={handleToggleAction}
           onDeleteAction={handleDeleteAction}
           onEditAction={handleEditAction}
+          onAddAction={handleAddAction}
         />
       ) : activeTab === 'horses' ? (
         <HorsesScreen horses={horses} onSelectHorse={handleSelectHorse} onAddHorse={handleAddHorse} flash={flash} />
@@ -4080,7 +4365,16 @@ export default function App() {
       ) : activeTab === 'calendar' ? (
         <CalendarScreen actions={actions} events={events} horses={horses} />
       ) : (
-        <SettingsScreen />
+        <HomeScreen
+          horses={horses}
+          actions={actions}
+          onSelectHorse={handleSelectHorse}
+          onNavigateToChat={() => navigate('chat')}
+          onToggleAction={handleToggleAction}
+          onDeleteAction={handleDeleteAction}
+          onEditAction={handleEditAction}
+          onAddAction={handleAddAction}
+        />
       )}
 
       {!selectedHorseData && <BottomNav activeTab={activeTab} onChange={(tab) => navigate(tab)} />}
