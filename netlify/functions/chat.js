@@ -115,8 +115,10 @@ const answerQuestion = async ({ question, context }) => {
     system:
       'You are a helpful assistant for a horse breeding operation. Answer the ' +
       "user's question using only the data provided. Be concise and practical. " +
-      'Refer to horses by their name/nickname. If the data does not contain the ' +
-      'answer, say so plainly rather than guessing.',
+      'Always refer to each horse by her barn name — the "name" given in the data ' +
+      'is her barn name; use it exactly and never invent a longer or registered ' +
+      'name. If the data does not contain the answer, say so plainly rather than ' +
+      'guessing.',
     messages: [
       {
         role: 'user',
