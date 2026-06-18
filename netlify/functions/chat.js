@@ -49,26 +49,52 @@ const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 // callers can fall back gracefully.
 //
 // Routing is always through the Netlify AI Gateway and NEVER the public Anthropic
-// API. The SDK auto-detects ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, but we resolve
-// them explicitly (falling back to the always-present NETLIFY_AI_GATEWAY_* pair)
-// so a missing configuration is reported as a clear, catchable error rather than
-// crashing at module load, and so the trailing slash on the injected base URL is
-// trimmed before the SDK appends `/v1/messages`.
+// API. Netlify injects ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL into every server
+// context; we pass them to the SDK explicitly, falling back to the always-present
+// NETLIFY_AI_GATEWAY_* pair if only those reach the runtime. If neither pair is
+// present (which happens on a deploy whose runtime predates AI features being
+// enabled), we raise a clear, catchable error instead of letting the SDK throw a
+// cryptic one, so log-mode can fall back to the rule-based parser and ask-mode can
+// surface a helpful message.
 let client;
 const getClient = () => {
   if (client) return client;
+  // Prefer the Anthropic-specific gateway variables (what the SDK auto-detects),
+  // and fall back to the always-present NETLIFY_AI_GATEWAY_* pair so the function
+  // still connects if only those are injected at runtime.
   const apiKey = process.env.ANTHROPIC_API_KEY || process.env.NETLIFY_AI_GATEWAY_KEY;
-  const rawBase = process.env.ANTHROPIC_BASE_URL || process.env.NETLIFY_AI_GATEWAY_BASE_URL;
-  if (!apiKey || !rawBase) {
-    throw new Error(
+  const baseURL = (
+    process.env.ANTHROPIC_BASE_URL || process.env.NETLIFY_AI_GATEWAY_BASE_URL
+  )?.replace(/\/+$/, '');
+  if (!apiKey || !baseURL) {
+    // None of the gateway variables made it into this runtime. That happens on a
+    // deploy whose function runtime predates AI features being enabled — the fix
+    // is a fresh production deploy with AI features on, not a code change. Raise a
+    // clear, catchable error so log-mode falls back to the offline parser and
+    // ask-mode shows a helpful message.
+    const err = new Error(
       'AI Gateway is not configured. Ensure the site has a production deploy with AI features enabled.',
     );
+    err.code = 'GATEWAY_NOT_CONFIGURED';
+    throw err;
   }
-  client = new Anthropic({ apiKey, baseURL: rawBase.replace(/\/+$/, '') });
+  client = new Anthropic({ apiKey, baseURL });
   return client;
 };
 
-const callClaude = (payload) => getClient().messages.create({ model: MODEL, ...payload });
+// One transport-level retry smooths over the gateway's occasional cold-start 5xx
+// and per-minute 429s, which would otherwise surface to the user as a hard error.
+const isTransient = (error) => error?.status === 429 || (error?.status >= 500 && error?.status < 600);
+
+const callClaude = async (payload) => {
+  try {
+    return await getClient().messages.create({ model: MODEL, ...payload });
+  } catch (error) {
+    if (!isTransient(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    return getClient().messages.create({ model: MODEL, ...payload });
+  }
+};
 
 // --- mode: 'ask' -------------------------------------------------------------
 const answerQuestion = async ({ question, context }) => {
@@ -298,10 +324,17 @@ export const handler = async (event) => {
     const text = await answerQuestion({ question: body.question, context: body.context });
     return { statusCode: 200, body: JSON.stringify({ text }) };
   } catch (error) {
-    console.error('Error in chat function:', error);
+    // Log the real cause (status + message) so production failures are diagnosable.
+    console.error('Error in chat function:', error?.status, error?.message);
+    const message =
+      error?.code === 'GATEWAY_NOT_CONFIGURED'
+        ? error.message
+        : error?.status
+          ? `The AI service returned an error (${error.status}). Please try again in a moment.`
+          : error?.message || 'Failed to reach the AI gateway';
     return {
       statusCode: 200,
-      body: JSON.stringify({ error: error.message || 'Failed to reach the AI gateway' }),
+      body: JSON.stringify({ error: message }),
     };
   }
 };
