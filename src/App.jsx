@@ -2096,6 +2096,82 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     return { ...next, ...deriveEvent(next) };
   };
 
+  // The most recent breeding date on record for a horse, so Claude can resolve
+  // "day N" reminders (counted from when she was bred) on the server side.
+  const recentBreedingDate = (horseId) => {
+    const bred = events
+      .filter(e => e.horseId === horseId && (e.type === 'breed' || e.type === 'breeding' || /bred|inseminat/i.test(e.title || '')))
+      .sort((a, b) => parseLocalDate(b.date) - parseLocalDate(a.date));
+    return bred.length ? bred[0].date : null;
+  };
+
+  // Coerce Claude's structured response into the exact shape the confirmation
+  // card and save handler expect — backfilling the horse from the conversation
+  // fallback, validating categories, and computing the recurring-check count.
+  const normalizeParsed = (p, text, fallbackHorse) => {
+    const validCategory = (c, dflt) => (ACTION_CATEGORIES.some(x => x.key === c) ? c : dflt);
+    const horseId = p.horseId || fallbackHorse?.id || null;
+    const horse = horses.find(h => h.id === horseId) || null;
+
+    let scheduleSeries = null;
+    if (p.scheduleSeries && p.scheduleSeries.intervalHours) {
+      const intervalHours = Math.max(1, Math.round(p.scheduleSeries.intervalHours));
+      const days = Math.max(1, Math.round(p.scheduleSeries.days || 3));
+      scheduleSeries = {
+        intervalHours,
+        days,
+        count: Math.max(1, Math.floor((days * 24) / intervalHours)),
+        label: p.scheduleSeries.label || 'Check',
+      };
+    }
+
+    return {
+      horseId,
+      horseName: horse?.barnName || p.horseName || 'Unknown',
+      actionTakenCategory: validCategory(p.actionTakenCategory, 'check'),
+      actionTaken: p.actionTaken || '',
+      actionTakenDate: p.actionTakenDate || '',
+      actionRequiredCategory: validCategory(p.actionRequiredCategory, 'check'),
+      actionItem: p.actionItem || '',
+      dueDate: p.dueDate || '',
+      scheduleSeries,
+      breedingStatusUpdate: p.breedingStatusUpdate || '',
+      note: p.note || text,
+    };
+  };
+
+  // Ask Claude (via the Netlify AI Gateway function) to parse a free-form note
+  // into the structured log entry. Throws on any failure so the caller can fall
+  // back to the local rule-based parser.
+  const parseInputAI = async (text, fallbackHorse) => {
+    const horseList = horses.map(h => ({
+      id: h.id,
+      barnName: h.barnName,
+      nickname: h.nickname || null,
+      breedingStatus: h.breedingStatus || null,
+    }));
+    const breedingDates = {};
+    horses.forEach(h => {
+      const d = recentBreedingDate(h.id);
+      if (d) breedingDates[h.id] = d;
+    });
+
+    const response = await fetch('/.netlify/functions/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'log',
+        message: text,
+        horses: horseList,
+        breedingDates,
+        today: today(),
+        fallbackHorseId: fallbackHorse?.id || null,
+      }),
+    });
+    const data = await response.json();
+    if (!data.parsed) throw new Error(data.error || 'No parse returned');
+    return normalizeParsed(data.parsed, text, fallbackHorse);
+  };
+
   const handleSend = async () => {
     if (!input.trim()) return;
     
@@ -2108,23 +2184,39 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
       // still attach to the right mare.
       const lastHorseId = [...messages].reverse().find(m => m.confirmData?.horseId)?.confirmData.horseId;
       const fallbackHorse = horses.find(h => h.id === lastHorseId) || null;
-      const parsed = { ...parseInput(userMessage, fallbackHorse), id: `c${Date.now()}` };
 
-      setMessages([
-        ...messages,
-        { 
-          role: 'user', 
-          text: userMessage, 
-          timestamp: new Date() 
-        },
-        { 
-          role: 'assistant', 
-          text: `Here's what I understood for ${parsed.horseName}. Review or edit, then save.`,
-          action: 'confirm',
-          confirmData: parsed,
-          timestamp: new Date(),
-        },
+      // Show a thinking state while Claude reads the note.
+      const loadingId = `t${Date.now()}`;
+      setMessages(prev => [
+        ...prev,
+        { role: 'user', text: userMessage, timestamp: new Date() },
+        { role: 'assistant', text: '🤔 Reading your note...', isLoading: true, loadingId, timestamp: new Date() },
       ]);
+
+      // Claude turns the free-form note into the structured confirmation card.
+      // If the AI call fails for any reason (gateway hiccup, offline), fall back
+      // to the local rule-based parser so logging still works.
+      let parsed;
+      try {
+        parsed = await parseInputAI(userMessage, fallbackHorse);
+      } catch (error) {
+        parsed = parseInput(userMessage, fallbackHorse);
+      }
+      parsed = { ...parsed, id: `c${Date.now()}` };
+
+      setMessages(prev =>
+        prev.map(m =>
+          m.loadingId === loadingId
+            ? {
+                role: 'assistant',
+                text: `Here's what I understood for ${parsed.horseName}. Review or edit, then save.`,
+                action: 'confirm',
+                confirmData: parsed,
+                timestamp: new Date(),
+              }
+            : m,
+        ),
+      );
     } else {
       // Ask question mode - show loading state
       setMessages(prev => [
@@ -2277,10 +2369,10 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
         })),
       };
 
-      // Call Netlify serverless function instead of API directly
+      // Call the Netlify function, which reaches Claude through the AI Gateway.
       const response = await fetch('/.netlify/functions/chat', {
         method: 'POST',
-        body: JSON.stringify({ question, context }),
+        body: JSON.stringify({ mode: 'ask', question, context }),
       });
 
       const data = await response.json();
