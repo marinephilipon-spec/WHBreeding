@@ -340,7 +340,9 @@ export const handler = async (event) => {
     console.error('Error in chat function:', error?.status, error?.message);
     const message =
       error?.code === 'GATEWAY_NOT_CONFIGURED'
-        ? error.message
+        ? "The AI assistant isn't available on this deploy yet. AI features are enabled for this " +
+          'site, so this clears once a fresh production deploy picks up the gateway credentials — ' +
+          'redeploy from Deploys → Trigger deploy → “Clear cache and deploy site”, then try again.'
         : error?.status
           ? `The AI service returned an error (${error.status}). Please try again in a moment.`
           : error?.message || 'Failed to reach the AI gateway';
