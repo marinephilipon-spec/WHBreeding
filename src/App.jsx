@@ -52,10 +52,16 @@ const formatDate = (d) =>
 
 const today = () => formatDate(new Date());
 
-// The action categories the breeding-log chat can infer. The key is stored on
-// events/actions (as `category`); the label is what the review card and editor
-// show. Keeping them here means the chat parser, the review card, and the edit
-// dropdown all stay in sync.
+// The current local time of day as "HH:MM". Used to stamp a logged event with
+// the moment it was created when the note itself doesn't state a time of day.
+const nowTime = () => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+// The action categories used by the timeline-event / action editor on a horse
+// profile. The key is stored on events/actions (as `category`); the label is
+// what the editor's dropdown shows.
 const ACTION_CATEGORIES = [
   { key: 'check', label: 'Check' },
   { key: 'breed', label: 'Breed / Inseminate' },
@@ -63,22 +69,6 @@ const ACTION_CATEGORIES = [
   { key: 'short-cycle', label: 'Short Cycle' },
   { key: 'foaled', label: 'Foaled Out' },
 ];
-const categoryLabel = (key) =>
-  (ACTION_CATEGORIES.find(c => c.key === key) || ACTION_CATEGORIES[0]).label;
-
-// Small pill used in the chat confirmation card to tag a section's category.
-const categoryChip = {
-  display: 'inline-block',
-  padding: '2px 10px',
-  background: '#EFEAE3',
-  color: '#6B5B4D',
-  borderRadius: '999px',
-  fontSize: '11px',
-  fontWeight: 600,
-  textTransform: 'uppercase',
-  letterSpacing: '0.04em',
-  whiteSpace: 'nowrap',
-};
 
 // Parse a date value into a Date in the LOCAL timezone. A bare "YYYY-MM-DD"
 // string is otherwise parsed by the Date constructor as UTC midnight, which
@@ -97,6 +87,15 @@ const addDays = (date, days) => {
   d.setDate(d.getDate() + days);
   return d;
 };
+
+// Capitalize the first letter — used so "fresh" reads back as "Fresh" in the
+// preview details while the lowercase form is kept inside the event title.
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// Add N days to a local "YYYY-MM-DD" string and return the same string format,
+// used to lay out the auto-created follow-up actions relative to an event date.
+const addDaysStr = (dateStr, n) =>
+  formatDate(addDays(parseLocalDate(dateStr || today()), n));
 
 const relativeDate = (d) => {
   const date = parseLocalDate(d);
@@ -200,40 +199,421 @@ const parseRelativeDate = (lower) => {
   return null;
 };
 
+// Pull a time of day out of free-form text — "11am", "11:00", "2:30pm" — and
+// return it as a 24-hour "HH:MM" string, or '' when none is stated.
+const parseTime = (lower) => {
+  let m = lower.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    if (m[3] === 'pm' && h < 12) h += 12;
+    if (m[3] === 'am' && h === 12) h = 0;
+    return `${String(h).padStart(2, '0')}:${m[2]}`;
+  }
+  m = lower.match(/\b(\d{1,2})\s*(am|pm)\b/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    if (m[2] === 'pm' && h < 12) h += 12;
+    if (m[2] === 'am' && h === 12) h = 0;
+    return `${String(h).padStart(2, '0')}:00`;
+  }
+  return '';
+};
+
+// Classify a logged chat message into one of the EVENT_TYPES. The order matters:
+// foaling and the negative/loss outcomes are checked before the positive ones so
+// "not in foal" never reads as "pregnant"; "double ovulation" is matched before a
+// bare "ovulation"; and the 28-day heartbeat is matched before the 14-day check.
+const classifyEventType = (lower) => {
+  if (/foaled?\s*out|gave\s*birth|\bdelivered\b|\bfoaled\b/.test(lower)) return 'foaled';
+  if (/miscarriage|reabsorb|resorb|abort|slipped|pregnancy\s*loss|lost\s+(?:the|her)\s+(?:foal|pregnancy)/.test(lower)) return 'pregnancy-loss';
+  if (/double\s*ovulation/.test(lower)) return 'double-ovulation';
+  if (/uterine|dirty\s*uterus|\buterus\b|\bfluid\b|endometritis/.test(lower)) return 'uterine-issue';
+  if (/lutalyse|\blute\b|estrumate|dinoprost|prostaglandin/.test(lower)) return 'lutalyse';
+  if (/(\d+\s*-?\s*(?:hour|hr)s?\s*checks?)|(\bevery\s+\d+\s*(?:hour|hr))/.test(lower)) return 'monitoring';
+  if (/28[\s-]?day|heart\s?beat/.test(lower)) return 'heartbeat';
+  if (/14[\s-]?day|preg(?:nancy)?\s*check|embryo|\bin\s*foal\b|\bpregnant\b/.test(lower)) return 'pregnancy-check';
+  if (/ovulat/.test(lower)) return 'ovulation';
+  if (/inseminat|\bbred\b|\bbreed\b|breeding|covered|live\s*cover|\bai\b/.test(lower)) return 'insemination';
+  if (/ultra\s?sound|\bscan\b|follicle|\d+\s*(?:mm)?\s*(?:right|left)|(?:right|left)\s*\d+/.test(lower)) return 'ultrasound';
+  return 'note';
+};
+
+// Best-effort guess at the stallion named in a breeding message. An explicit
+// "to/by/with Vitalis" wins; otherwise the last capitalized word that isn't the
+// mare's own name or a breeding keyword is taken (e.g. "Inseminate Roma fresh
+// Vitalis" -> "Vitalis"); failing that, the mare's planned stallion is used.
+// Always editable afterwards.
+const STALLION_STOPWORDS = new Set([
+  'inseminate', 'inseminated', 'bred', 'breed', 'breeding', 'covered', 'fresh', 'frozen',
+  'chilled', 'cooled', 'natural', 'ovulation', 'ovulated', 'check', 'pregnancy', 'ultrasound',
+  'scan', 'lutalyse', 'lute', 'foaled', 'foal', 'heartbeat', 'day', 'right', 'left', 'am', 'pm',
+  'double', 'uterine', 'uterus', 'heat', 'embryo', 'monitoring', 'note', 'flush',
+]);
+const parseStallion = (text, horse) => {
+  let m = text.match(/\b(?:to|by|with|stallion|sire)\s+([A-Z][a-zA-Z'-]+)/);
+  if (m) return m[1];
+  const mare = (horse?.barnName || '').toLowerCase();
+  const nick = (horse?.nickname || '').toLowerCase();
+  const tokens = text.match(/[A-Z][a-zA-Z'-]+/g) || [];
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const tl = tokens[i].toLowerCase();
+    if (tl === mare || tl === nick || STALLION_STOPWORDS.has(tl)) continue;
+    return tokens[i];
+  }
+  return horse?.plannedStallion || '';
+};
+
 // The breeding-cycle statuses a mare can be in. Shared by the profile dropdown
 // and the chat, so logging "bred Bella" in the chat can move her status here.
 const BREEDING_STATUSES = [
   'Waiting for cycle',
   'Ready to breed',
   'Inseminated',
+  'Ovulation Confirmed',
   '14-day pregnancy check',
   'Confirmed in foal',
   'Lost - back open',
+  'Foaled',
 ];
 
 const getStatusColor = (status) => ({
   'Waiting for cycle': DS.colors.status.waiting,
   'Ready to breed': DS.colors.status.ready,
   'Inseminated': DS.colors.status.bred,
+  'Ovulation Confirmed': DS.colors.gold,
   '14-day pregnancy check': DS.colors.status.bred,
   'Confirmed in foal': DS.colors.status.foal,
   'Lost - back open': DS.colors.status.open,
+  'Foaled': DS.colors.status.open,
 }[status] || DS.colors.textMuted);
 
-// Infer the breeding-cycle status a logged chat message implies, so that
-// recording what happened to a mare also moves the status badge/dropdown to
-// match. Returns '' when the message says nothing status-relevant. The negative
-// cases ("not in foal", "came back open") are checked before the positive ones
-// so "not pregnant" never reads as "pregnant".
-const inferBreedingStatus = (lower, takenCategory) => {
-  if (/\bnot\s+(?:in\s+foal|pregnant)\b|back\s+open|reabsorb|aborted|slipped|lost\s+(?:the|her)\s+(?:foal|pregnancy)/.test(lower)) {
-    return 'Lost - back open';
+// Average equine gestation, used to estimate a foaling date from the breeding
+// date when an explicit foal-due date hasn't been entered.
+const GESTATION_DAYS = 340;
+
+// The event types the breeding-log chat can recognise. The key is stored on the
+// logged event (`event.type`); the label is what the preview card and the Edit
+// Event "Event Type" dropdown show. One catalog keeps the parser, the preview,
+// and the editor in sync.
+const EVENT_TYPES = [
+  { key: 'insemination', label: 'insemination' },
+  { key: 'ultrasound', label: 'ultrasound check' },
+  { key: 'ovulation', label: 'ovulation confirmed' },
+  { key: 'pregnancy-check', label: '14-day pregnancy check' },
+  { key: 'heartbeat', label: '28-day heartbeat check' },
+  { key: 'lutalyse', label: 'lutalyse given' },
+  { key: 'monitoring', label: 'intensive monitoring' },
+  { key: 'double-ovulation', label: 'double ovulation' },
+  { key: 'uterine-issue', label: 'uterine issue' },
+  { key: 'pregnancy-loss', label: 'pregnancy loss' },
+  { key: 'foaled', label: 'foaled out' },
+  { key: 'note', label: 'note' },
+];
+
+// Map number words to digits so relative-time phrases like "in two days" or
+// "in a week" resolve to a day offset alongside the numeric "in 2 days".
+const NUMBER_WORDS = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+const parseCount = (w) => NUMBER_WORDS[w.toLowerCase()] ?? parseInt(w, 10);
+
+// Signals that a clause is asking for a follow-up to be scheduled — an action
+// verb ("recheck", "scan again"), a reminder request, or an explicit "create
+// action / reminder / task". Used to tell a genuine request ("recheck in 2
+// days") apart from text that merely states timing ("checked her 2 days ago").
+const ACTION_REQUEST_RE = /\b(recheck|re-?check|check\s+again|rescan|re-?scan|scan\s+again|follow[\s-]?up|remind|reminder|(?:create|add|set|schedule|make)\s+(?:up\s+)?(?:an?\s+)?(?:action|reminder|task|follow[\s-]?up)|action\s+to)\b/i;
+
+// Pull explicitly-requested follow-up actions out of a chat message — e.g.
+// "create action to recheck in 2 days", "remind me in a week to call the vet",
+// "follow up in 3 days". These are scheduled in addition to whatever follow-ups
+// the event type already implies, so an action the user spells out in words is
+// never silently dropped (a plain "note" used to create nothing at all). The due
+// date is counted forward from today, since an imperative "in N days" is meant
+// from the moment of logging — unlike the biological intervals that key off the
+// event's own date. Returns ready-built action objects in the same shape the
+// `deriveEvent` factory produces, so they render and save identically.
+const parseExplicitActions = (text, name) => {
+  const out = [];
+  const timeRe = /\bin\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+(day|days|week|weeks|month|months)\b/gi;
+  let m;
+  while ((m = timeRe.exec(text)) !== null) {
+    const before = text.slice(0, m.index);
+    if (!ACTION_REQUEST_RE.test(before)) continue;
+    const qty = parseCount(m[1]);
+    if (!qty || qty < 1) continue;
+    const unit = m[2].toLowerCase();
+    const days = qty * (/week/.test(unit) ? 7 : /month/.test(unit) ? 30 : 1);
+
+    // Derive a human label from the clause. Prefer the verb phrase after "to" —
+    // which may come before the time ("action to recheck in 2 days") or after it
+    // ("remind me in a week to call the vet"); else a recognised action verb in
+    // the clause; else fall back to "Follow-up"/"Recheck".
+    const after = text.slice(m.index + m[0].length);
+    let label = '';
+    const toBefore = before.match(/\bto\s+([a-z][a-z\s'-]*?)\s*$/i);
+    const toAfter = after.match(/^\s*to\s+([a-z][a-z\s'-]+)/i);
+    if (toBefore) label = toBefore[1];
+    else if (toAfter) label = toAfter[1];
+    if (!label) {
+      const verb = before.match(/\b(recheck|re-?check|check\s+again|rescan|re-?scan|scan\s+again|flush|breed|ultrasound|monitor|teas[e]?)\b[a-z\s'-]*$/i);
+      if (verb) label = verb[0];
+    }
+    label = label
+      .replace(/\b(her|him|it|them|me|us|again|the\s+mare)\b/gi, '')
+      .replace(/[^a-z\s'-]/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const fallback = /follow[\s-]?up/i.test(before) ? 'Follow-up' : 'Recheck';
+    const title = label ? cap(label) : fallback;
+    out.push({
+      label: title,
+      bullet: title,
+      title: `${title} - ${name}`,
+      dueDate: addDaysStr(today(), days),
+      dueTime: '',
+      priority: 'medium',
+      category: 'check',
+    });
   }
-  if (/confirmed\s+in\s+foal|\bin\s+foal\b|\bpregnant\b|heartbeat|positive\s+(?:preg|pregnancy)/.test(lower)) {
-    return 'Confirmed in foal';
+  return out;
+};
+
+// Given a fully-resolved set of event fields, derive everything that flows from
+// the event type: the display title, the detail rows shown on the preview card,
+// the follow-up actions to auto-create (each with its due date, priority, and a
+// one-line bullet), and the breeding-status the event implies. This is the
+// single source of truth shared by the chat parser, the preview card, and the
+// Edit Event modal, so what you see in the preview is exactly what gets saved.
+//
+// `f` carries: { name, eventType, date, time, semenType, stallion,
+// follicleRight, follicleLeft, dose, result, series, extraActions }.
+// `extraActions` are follow-ups the user asked for in words (see
+// parseExplicitActions); they're appended to whatever the event type implies.
+const deriveEvent = (f) => {
+  const name = f.name || 'Mare';
+  const dateTime = f.date ? (f.time ? `${f.date} ${f.time}` : f.date) : '';
+  const details = [{ label: 'Mare', value: name }];
+  if (dateTime) details.push({ label: 'Date/Time', value: dateTime });
+
+  // Follow-up action factory: due dates are counted off the event's own date.
+  const act = (label, bullet, title, days, priority, opts = {}) => ({
+    label,
+    bullet,
+    title: `${title} - ${name}`,
+    dueDate: addDaysStr(f.date, days),
+    dueTime: opts.time ? (f.time || '') : '',
+    priority,
+    category: opts.category || 'check',
+    ...(opts.series ? { series: opts.series } : {}),
+  });
+
+  let title = `${name} - Note`;
+  let actions = [];
+  let status = '';
+
+  switch (f.eventType) {
+    case 'insemination': {
+      title = `${name} - Inseminated${f.semenType ? ` (${f.semenType})` : ''}${f.stallion ? ` - ${f.stallion}` : ''}`;
+      if (f.semenType) details.push({ label: 'Semen', value: cap(f.semenType) });
+      if (f.stallion) details.push({ label: 'Stallion', value: f.stallion });
+      actions = [
+        act('24-hour Check', '24-hour Ovulation Check', 'Ovulation Check', 1, 'high', { time: true }),
+        act('Pregnancy Check', '14-day Pregnancy Check', '14-day Pregnancy Check', 14, 'medium'),
+      ];
+      status = 'Inseminated';
+      break;
+    }
+    case 'ovulation': {
+      title = `${name} - Ovulation Confirmed`;
+      actions = [act('Pregnancy Check', '7-day Pregnancy Check', '7-day Pregnancy Check', 7, 'medium')];
+      status = 'Ovulation Confirmed';
+      break;
+    }
+    case 'pregnancy-check': {
+      title = `${name} - 14-day Pregnancy Check`;
+      if (f.result === 'positive') {
+        details.push({ label: 'Result', value: 'Positive — embryo detected' });
+        actions = [act('Heartbeat Check', '28-day Heartbeat Check', '28-day Heartbeat Check', 28, 'medium')];
+        status = 'Confirmed in foal';
+      } else if (f.result === 'negative') {
+        details.push({ label: 'Result', value: 'Negative — not in foal' });
+        actions = [act('Cycle Restart', 'Cycle Restart Watch', 'Cycle Restart Watch', 7, 'medium')];
+        status = 'Lost - back open';
+      } else {
+        status = '14-day pregnancy check';
+      }
+      break;
+    }
+    case 'heartbeat': {
+      title = `${name} - 28-day Heartbeat Check`;
+      details.push({ label: 'Result', value: 'Heartbeat detected' });
+      actions = [act('Monthly Check', 'Monthly Check', 'Monthly Check', 30, 'low')];
+      status = 'Confirmed in foal';
+      break;
+    }
+    case 'lutalyse': {
+      title = `${name} - Lutalyse Given`;
+      if (f.dose) details.push({ label: 'Dose', value: f.dose });
+      actions = [act('Heat Watch', 'New Heat Watch', 'New Heat Watch', 7, 'high')];
+      break;
+    }
+    case 'monitoring': {
+      const hrs = f.series ? f.series.intervalHours : 12;
+      title = `${name} - Intensive Monitoring (${hrs}-hour checks)`;
+      if (f.follicleRight || f.follicleLeft) {
+        details.push({ label: 'Follicle', value: `Right ${f.follicleRight || '?'}mm, Left ${f.follicleLeft || '?'}mm` });
+      }
+      actions = [{
+        label: `${hrs}-hour Check`,
+        bullet: `${hrs}-hour Check`,
+        title: `${hrs}-hour Check - ${name}`,
+        dueDate: f.date || today(),
+        dueTime: f.time || '',
+        priority: 'high',
+        category: 'check',
+        series: f.series || { intervalHours: hrs, days: 3, count: Math.max(1, Math.floor((3 * 24) / hrs)) },
+      }];
+      break;
+    }
+    case 'double-ovulation': {
+      title = `${name} - Double Ovulation`;
+      actions = [act('Complication Watch', 'Double Ovulation Watch', 'Double Ovulation Watch', 7, 'high')];
+      break;
+    }
+    case 'uterine-issue': {
+      title = `${name} - Uterine Issue`;
+      actions = [act('URGENT', 'URGENT Uterine Flush', 'URGENT - Uterine Flush', 0, 'critical')];
+      break;
+    }
+    case 'pregnancy-loss': {
+      title = `${name} - Pregnancy Lost`;
+      actions = [act('Cycle Restart', 'Cycle Restart Watch', 'Cycle Restart Watch', 7, 'medium')];
+      status = 'Lost - back open';
+      break;
+    }
+    case 'foaled': {
+      title = `${name} - Foaled Out`;
+      status = 'Foaled';
+      break;
+    }
+    case 'ultrasound': {
+      title = `${name} - Ultrasound Check`;
+      if (f.follicleRight || f.follicleLeft) {
+        details.push({ label: 'Follicle', value: `Right ${f.follicleRight || '?'}mm, Left ${f.follicleLeft || '?'}mm` });
+      }
+      break;
+    }
+    default:
+      title = `${name} - Note`;
   }
-  if (takenCategory === 'breed') return 'Inseminated';
-  return '';
+
+  // Append any follow-ups the user explicitly requested in the message
+  // ("create action to recheck in 2 days"), so they're scheduled regardless of
+  // the event type — including a plain note, which otherwise creates nothing.
+  if (Array.isArray(f.extraActions) && f.extraActions.length) {
+    actions = [...actions, ...f.extraActions];
+  }
+
+  return { eventTitle: title, eventDetails: details, actions, breedingStatusUpdate: status };
+};
+
+// The short "detail" string stored alongside a logged event, shown after the
+// date on the timeline and read by the profile's breeding summary (e.g. semen
+// type and stallion). Derived from whichever fields the event type carries.
+const buildEventDetail = (f) => {
+  const parts = [];
+  if (f.eventType === 'insemination') {
+    if (f.semenType) parts.push(cap(f.semenType));
+    if (f.stallion) parts.push(f.stallion);
+  } else if (f.eventType === 'ultrasound' || f.eventType === 'monitoring') {
+    if (f.follicleRight || f.follicleLeft) parts.push(`R ${f.follicleRight || '?'}mm / L ${f.follicleLeft || '?'}mm`);
+  } else if (f.eventType === 'lutalyse') {
+    if (f.dose) parts.push(`Dose ${f.dose}`);
+  } else if (f.eventType === 'pregnancy-check' && f.result) {
+    parts.push(cap(f.result));
+  }
+  return parts.join(' • ');
+};
+// the wording of a breeding event, so the foaling timeline and breeding summary
+// can show it without a dedicated field. Returns null when nothing is stated.
+const getSemenType = (event) => {
+  if (!event) return null;
+  const t = `${event.title || ''} ${event.detail || ''}`.toLowerCase();
+  if (/frozen/.test(t)) return 'Frozen';
+  if (/chilled|cooled|cool\b/.test(t)) return 'Chilled';
+  if (/fresh/.test(t)) return 'Fresh';
+  if (/natural|live\s*cover|pasture/.test(t)) return 'Natural';
+  return null;
+};
+
+// Build a pregnancy summary for a mare straight from her logged breeding events,
+// so the profile can show a foaling estimate, a progress bar, and a milestone
+// timeline without anyone having to fill in a due date by hand. The most recent
+// breeding event anchors the timeline; an explicit `foalDueDate` on the horse
+// wins over the estimate when present. Returns null when there is nothing to
+// show (no breeding on record and no explicit due date).
+const derivePregnancy = (horse, events) => {
+  const bred = events
+    .filter(e => e.horseId === horse.id
+      && (e.type === 'breed' || e.type === 'breeding' || /\b(bred|inseminat|covered)\b/i.test(e.title || '')))
+    .sort((a, b) => parseLocalDate(b.date) - parseLocalDate(a.date));
+  const bredEvent = bred[0] || null;
+  const bredDate = bredEvent ? bredEvent.date : (horse.conceptionDate || null);
+
+  if (!bredDate && !horse.foalDueDate) return null;
+
+  const dueDate = horse.foalDueDate
+    || (bredDate ? formatDate(addDays(parseLocalDate(bredDate), GESTATION_DAYS)) : null);
+  if (!dueDate) return null;
+
+  const start = bredDate
+    ? parseLocalDate(bredDate)
+    : addDays(parseLocalDate(dueDate), -GESTATION_DAYS);
+  const due = parseLocalDate(dueDate);
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const total = Math.max(1, Math.round((due - start) / 86400000));
+  const elapsed = Math.max(0, Math.round((now - start) / 86400000));
+  const progress = Math.max(0, Math.min(100, Math.round((elapsed / total) * 100)));
+
+  // Semen type (parsed from the breeding event) and the pregnancy-confirmation
+  // event — the first post-breeding check that reports a result — both surfaced
+  // in the foaling timeline.
+  const stallionName = horse.plannedStallion || '';
+  const semenType = getSemenType(bredEvent);
+  const confirmedEvent = events
+    .filter(e => e.horseId === horse.id
+      && parseLocalDate(e.date) >= start
+      && /confirm|in\s*foal|embryo|preg|14[\s-]?day|heartbeat|scan|ultra/i.test(`${e.title || ''} ${e.detail || ''}`))
+    .sort((a, b) => parseLocalDate(a.date) - parseLocalDate(b.date))[0] || null;
+  const confirmedDate = confirmedEvent ? confirmedEvent.date : null;
+
+  // The pregnancy milestones shown on the foaling timeline: insemination, the
+  // 7- and 14-day embryo checks, the 28-day heartbeat check, and the expected
+  // foaling date. Each is marked done once its date has passed.
+  const milestones = [
+    { key: 'insemination', label: 'Insemination', date: bredDate, color: '#A8C5E8', detail: semenType ? [semenType, stallionName].filter(Boolean).join(' • ') : stallionName },
+    { key: 'embryo7', label: 'Embryo Detected (7-day)', date: bredDate ? formatDate(addDays(start, 7)) : null, color: '#C9E2CC', detail: '' },
+    { key: 'embryo14', label: 'Embryo Confirmed (14-day)', date: confirmedDate || (bredDate ? formatDate(addDays(start, 14)) : null), color: '#A9D3AE', detail: (confirmedEvent && confirmedEvent.detail) || '' },
+    { key: 'heartbeat28', label: 'Heartbeat Check (28-day)', date: bredDate ? formatDate(addDays(start, 28)) : null, color: '#E8D5A8', detail: '' },
+    { key: 'foaling', label: 'Expected Foaling', date: dueDate, color: '#D4A574', detail: '' },
+  ].map(m => ({
+    ...m,
+    done: m.date ? parseLocalDate(m.date) <= now : false,
+    daysUntil: m.date ? getDaysUntilDue(m.date) : null,
+  }));
+
+  return {
+    bredEvent,
+    bredDate,
+    dueDate,
+    total,
+    elapsed,
+    progress,
+    daysToFoal: getDaysUntilDue(dueDate),
+    semenType,
+    confirmedDate,
+    confirmedEvent,
+    milestones,
+  };
 };
 
 // A horse's lifecycle status — independent of where a mare is in her breeding
@@ -268,12 +648,40 @@ const getEventColor = (event) => {
   if (/pregnan|14[\s-]?day/.test(t)) return '#D4A574';             // 14-day pregnancy check
   if (/birth|foaled|foaling/.test(t)) return '#6BA881';            // gave birth
   switch (event.type) {
-    case 'breed': return '#5A8784';        // bred / inseminated
-    case 'drug': return '#DC8A4C';         // administered drug
+    case 'breed': case 'insemination': return '#5A8784';   // bred / inseminated
+    case 'drug': case 'lutalyse': return '#DC8A4C';         // administered drug
     case 'short-cycle': return '#8B7E8A';  // short cycle
-    case 'foaled': return '#6BA881';       // foaled out (gave birth)
+    case 'ovulation': case 'foaled': return '#6BA881';      // ovulation / gave birth
+    case 'double-ovulation': return '#D4A574';
+    case 'uterine-issue': return '#C84C3C';
+    case 'monitoring': return '#3E6FB0';   // intensive monitoring
+    case 'pregnancy-loss': return '#8B7E8A';
     case 'check': return '#3E6FB0';        // general check
     default: return DS.colors.primaryLight;
+  }
+};
+
+// A glyph to show inside the colored circle next to a timeline event, picked
+// from the event's wording first (so the two pregnancy checks and a birth each
+// get their own icon) and falling back to the broad category.
+const getEventIcon = (event) => {
+  const t = `${event.title || ''} ${event.detail || ''}`.toLowerCase();
+  if (/ovulat/.test(t)) return '✓';
+  if (/heartbeat|28[\s-]?day/.test(t)) return '💗';
+  if (/embryo|14[\s-]?day|pregnan|scan|ultra/.test(t)) return '🔍';
+  if (/foaled|birth|foaling/.test(t)) return '🐴';
+  if (/drug|inject|hcg|prostag|regumate/.test(t)) return '💊';
+  switch (event.type) {
+    case 'breed': case 'insemination': return '💉';
+    case 'drug': case 'lutalyse': return '💊';
+    case 'monitoring': return '⏱️';
+    case 'double-ovulation': return '✓';
+    case 'uterine-issue': return '⚠️';
+    case 'pregnancy-loss': return '💔';
+    case 'foaled': return '🐴';
+    case 'check': return '🔍';
+    case 'short-cycle': return '🔄';
+    default: return '•';
   }
 };
 
@@ -549,7 +957,7 @@ function FileViewer({ file, onClose }) {
 // HORSE DETAIL SCREEN
 // ============================================================================
 
-function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onUpdateStallion, onToggleBreedingList, onUpdateHorse, onUpdateHorseStatus, onDeleteHorse, onSaveTimelineItem, onDeleteEvent, onDeleteAction }) {
+function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onUpdateStallion, onToggleBreedingList, onUpdateHorse, onUpdateHorseStatus, onDeleteHorse, onSaveTimelineItem, onDeleteEvent, onDeleteAction, onToggleAction }) {
   const [activeTab, setActiveTab] = useState('timeline');
   const [status, setStatus] = useState(horse.breedingStatus || '');
   const [stallion, setStallion] = useState(horse.plannedStallion || '');
@@ -563,6 +971,11 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   const [editForm, setEditForm] = useState(horse);
   const [editErrors, setEditErrors] = useState({});
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showFoalModal, setShowFoalModal] = useState(false);
+  // Whether the editable breeding controls (status, planned stallion, breeding
+  // list) are expanded. Collapsed by default so the profile reads cleanly, but
+  // every control stays one tap away.
+  const [showManage, setShowManage] = useState(false);
   // The timeline item (event or action) currently being edited, and its working
   // copy. `itemForm` normalizes both record shapes onto common fields so a single
   // editor can edit either kind — and switch between them via the type dropdown.
@@ -573,6 +986,10 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
   const horseEvents = events.filter(e => e.horseId === horse.id).sort((a, b) => new Date(b.date) - new Date(a.date));
   const horseActions = actions.filter(a => a.horseId === horse.id);
   const age = calculateAge(horse.yob);
+  // A foaling estimate + milestone timeline derived from this mare's breeding
+  // events, shown on her profile once she has been bred. Null for non-mares and
+  // for mares with no breeding on record.
+  const pregnancy = horse.type === 'mare' ? derivePregnancy(horse, events) : null;
 
   const startEditing = () => {
     setEditForm(horse);
@@ -766,10 +1183,10 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
     <div style={{ display: 'flex', gap: DS.spacing.sm }}>
       <button
         onClick={startEditing}
-        style={{...styles.buttonBase, ...styles.buttonSecondary, padding: `${DS.spacing.sm} ${DS.spacing.md}`}}
+        style={{...styles.buttonBase, ...styles.buttonPrimary, padding: `${DS.spacing.sm} ${DS.spacing.md}`}}
         title="Edit profile"
       >
-        <Edit2 size={18} /> Edit
+        <Edit2 size={16} /> Edit Profile
       </button>
       <button
         onClick={() => setShowDeleteConfirm(true)}
@@ -802,9 +1219,40 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
     );
   }
 
+  // Values derived for the redesigned profile: the most recent event (shown in
+  // the "Last event" stat card), a helper for the "Day N" badge on each timeline
+  // event (days since breeding), and small date formatters.
+  const lastEvent = horseEvents[0] || null;
+  const bredDateObj = pregnancy && pregnancy.bredDate ? parseLocalDate(pregnancy.bredDate) : null;
+  const eventDay = (date) => {
+    if (!bredDateObj) return null;
+    const n = Math.round((parseLocalDate(date) - bredDateObj) / 86400000);
+    return n >= 0 ? n : null;
+  };
+  const statCardBase = { flex: '1 1 140px', minWidth: '128px', background: DS.colors.white, border: `1px solid ${DS.colors.border}`, borderRadius: DS.radius.lg, padding: DS.spacing.lg, boxShadow: DS.shadow.xs };
+  const PRIORITY_BADGE = { critical: { label: 'CRIT', bg: DS.colors.error }, high: { label: 'HIGH', bg: DS.colors.status.waiting }, medium: { label: 'MED', bg: DS.colors.primary }, low: { label: 'LOW', bg: DS.colors.textMuted } };
+  const shortDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const longDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  const mediumDate = (d) => parseLocalDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const isMare = horse.type === 'mare';
+  const statusValue = isMare ? status : (horse.status || '');
+  const statusColor = isMare ? getStatusColor(status) : getHorseStatusColor(horse.status);
+
   return (
     <div style={styles.page}>
-      <Header title={horse.barnName} subtitle={horse.nickname && horse.nickname !== horse.barnName ? `${horse.type.toUpperCase()} • BARN NAME: ${horse.nickname.toUpperCase()}` : horse.type.toUpperCase()} onBack={onBack} action={headerActions} />
+      {/* Profile header — name, a one-line summary, and the edit/delete actions. */}
+      <div style={{ ...styles.header, alignItems: 'flex-start' }}>
+        <button onClick={onBack} style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: `0 ${DS.spacing.md} 0 0`, fontSize: '24px', display: 'flex', alignItems: 'center', marginTop: '2px' }}>
+          ←
+        </button>
+        <div style={{ flex: 1 }}>
+          <h1 style={styles.h1}>{horse.nickname || horse.barnName}</h1>
+          <p style={{ ...styles.body, color: DS.colors.textSecondary, marginTop: DS.spacing.xs }}>
+            {[horse.breed, isMare ? 'Mare' : horse.type.charAt(0).toUpperCase() + horse.type.slice(1)].filter(Boolean).join(' ')} · Age {age}
+          </p>
+        </div>
+        {headerActions}
+      </div>
 
       {showDeleteConfirm && (
         <div
@@ -836,250 +1284,364 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
         <FileViewer file={viewingFile} onClose={() => setViewingFile(null)} />
       )}
 
+      {showFoalModal && pregnancy && (
+        <div
+          onClick={() => setShowFoalModal(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(26, 23, 21, 0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: DS.spacing.xl, zIndex: 300 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: DS.colors.white, borderRadius: DS.radius.lg, maxWidth: '480px', width: '100%', maxHeight: '90vh', overflowY: 'auto', boxShadow: DS.shadow.md }}
+          >
+            <div style={{ padding: DS.spacing.xl, borderBottom: `1px solid ${DS.colors.border}` }}>
+              <h2 style={{...styles.h2, margin: 0}}>{horse.nickname || horse.barnName} — Foal Timeline</h2>
+              <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>
+                Expected due: {longDate(pregnancy.dueDate)}
+              </p>
+            </div>
+
+            <div style={{ padding: DS.spacing.xl, display: 'flex', flexDirection: 'column', gap: DS.spacing.xl }}>
+              {/* Breeding details */}
+              <div style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, border: `1px solid ${DS.colors.border}`, padding: DS.spacing.lg }}>
+                <h3 style={{...styles.h3, marginBottom: DS.spacing.md}}>Breeding Details</h3>
+                {[
+                  { label: 'Sire', value: stallion || 'Unknown' },
+                  { label: 'Semen Type', value: pregnancy.semenType || '—' },
+                  { label: 'Bred Date', value: pregnancy.bredDate ? mediumDate(pregnancy.bredDate) : '—' },
+                  {
+                    label: 'Confirmed Date',
+                    value: pregnancy.confirmedDate
+                      ? `${mediumDate(pregnancy.confirmedDate)}${/14[\s-]?day/i.test(`${pregnancy.confirmedEvent.title || ''} ${pregnancy.confirmedEvent.detail || ''}`) ? ' (14-day)' : ''}`
+                      : 'Pending',
+                  },
+                ].map((row, i, arr) => (
+                  <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: i < arr.length - 1 ? DS.spacing.sm : 0 }}>
+                    <span style={styles.bodySmall}>{row.label}:</span>
+                    <span style={{...styles.bodySmall, fontWeight: DS.typography.weight.semibold, color: DS.colors.text}}>{row.value}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Progress */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: DS.spacing.sm }}>
+                  <span style={{...styles.body, fontWeight: DS.typography.weight.semibold, color: DS.colors.text}}>Pregnancy Progress</span>
+                  <span style={styles.bodySmall}>{pregnancy.elapsed}/{pregnancy.total} days ({pregnancy.progress}%)</span>
+                </div>
+                <div style={{ width: '100%', height: '12px', background: DS.colors.bgAlt, borderRadius: DS.radius.full, overflow: 'hidden', border: `1px solid ${DS.colors.border}` }}>
+                  <div style={{ width: `${pregnancy.progress}%`, height: '100%', background: DS.colors.status.foal, borderRadius: DS.radius.full }} />
+                </div>
+              </div>
+
+              {/* Pregnancy timeline */}
+              <div>
+                <h3 style={{...styles.h3, marginBottom: DS.spacing.md}}>Pregnancy Timeline</h3>
+                {pregnancy.milestones.map((m, idx) => (
+                  <div key={m.key} style={{ display: 'flex', gap: DS.spacing.md }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                      <div style={{ width: '16px', height: '16px', borderRadius: '50%', background: m.color, flexShrink: 0, marginTop: '3px', border: `2px solid ${m.done ? m.color : DS.colors.white}`, boxShadow: m.done ? 'none' : `0 0 0 1px ${DS.colors.border}` }} />
+                      {idx < pregnancy.milestones.length - 1 && (
+                        <div style={{ width: '2px', flex: 1, minHeight: '24px', background: DS.colors.border, marginTop: '2px' }} />
+                      )}
+                    </div>
+                    <div style={{ paddingBottom: idx < pregnancy.milestones.length - 1 ? DS.spacing.lg : 0 }}>
+                      <div style={{...styles.body, fontWeight: DS.typography.weight.medium}}>{m.label}</div>
+                      <div style={{...styles.bodySmall, color: DS.colors.textMuted}}>
+                        {m.date ? longDate(m.date) : 'TBD'}{m.detail ? ` • ${m.detail}` : ''}
+                      </div>
+                      <div style={{ ...styles.bodySmall, marginTop: '2px', color: m.done ? DS.colors.success : DS.colors.textSecondary, fontWeight: DS.typography.weight.medium }}>
+                        {m.done
+                          ? '✓ Completed'
+                          : m.daysUntil != null
+                            ? `⏳ Due in ${m.daysUntil} day${m.daysUntil === 1 ? '' : 's'}`
+                            : 'Upcoming'}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ padding: DS.spacing.xl, borderTop: `1px solid ${DS.colors.border}` }}>
+              <button onClick={() => setShowFoalModal(false)} style={{...styles.buttonBase, ...styles.buttonSecondary, width: '100%'}}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={styles.scrollable}>
         <div style={styles.contentPadding}>
-          {/* Status */}
-          <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-            <label style={styles.label}>Status</label>
-            <select
-              value={horse.status || ''}
-              onChange={(e) => onUpdateHorseStatus(horse.id, e.target.value)}
-              style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getHorseStatusColor(horse.status)}`}}
-            >
-              <option value="">Select status...</option>
-              {HORSE_STATUSES.map(s => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-          </div>
-
-          <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: DS.spacing.lg, marginBottom: DS.spacing.lg }}>
-              <div>
-                <div style={styles.label}>Breed</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.breed}</p>
-              </div>
-              <div>
-                <div style={styles.label}>Age</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{age} years old</p>
-              </div>
-              <div>
-                <div style={styles.label}>Color</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.color}</p>
-              </div>
-              <div>
-                <div style={styles.label}>{horse.dateOfBirth ? 'Date of Birth' : 'Born'}</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dateOfBirth ? parseLocalDate(horse.dateOfBirth).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
-              </div>
-              {horse.owner && (
-                <div>
-                  <div style={styles.label}>Owner</div>
-                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.owner}</p>
-                </div>
-              )}
-              {horse.discipline && (
-                <div>
-                  <div style={styles.label}>Discipline</div>
-                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.discipline}</p>
-                </div>
-              )}
-              {horse.size && (
-                <div>
-                  <div style={styles.label}>Size</div>
-                  <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.size}</p>
-                </div>
+          {/* Summary stat cards — Status, Last Event, and (for a bred mare) a
+              tappable Foal Due card that opens the foaling timeline. */}
+          <div style={{ display: 'flex', gap: DS.spacing.md, marginBottom: DS.spacing.lg, flexWrap: 'wrap' }}>
+            <div style={statCardBase}>
+              <div style={styles.label}>Status</div>
+              <p style={{ ...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold, color: statusColor }}>
+                {statusValue || 'Not set'}{isMare && status === 'Confirmed in foal' ? ' ✓' : ''}
+              </p>
+            </div>
+            <div style={statCardBase}>
+              <div style={styles.label}>Last Event</div>
+              {lastEvent ? (
+                <>
+                  <p style={{ ...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold }}>{lastEvent.title}</p>
+                  <p style={{ ...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted }}>{shortDate(lastEvent.date)}</p>
+                </>
+              ) : (
+                <p style={{ ...styles.body, marginTop: DS.spacing.sm, color: DS.colors.textMuted }}>No events yet</p>
               )}
             </div>
-            {horse.additionalInfo && (
-              <div style={{ paddingTop: DS.spacing.md, borderTop: `1px solid ${DS.colors.border}` }}>
-                <div style={styles.label}>Additional Information</div>
-                <p style={{...styles.body, marginTop: DS.spacing.sm, whiteSpace: 'pre-wrap'}}>{horse.additionalInfo}</p>
-              </div>
+            {pregnancy && (
+              <button
+                onClick={() => setShowFoalModal(true)}
+                style={{ ...statCardBase, border: `2px solid ${DS.colors.primary}`, cursor: 'pointer', textAlign: 'left', fontFamily: DS.typography.family.base }}
+                title="View foal timeline"
+              >
+                <div style={styles.label}>Foal Due</div>
+                <p style={{ ...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold, color: DS.colors.primary }}>{shortDate(pregnancy.dueDate)}</p>
+                <p style={{ ...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted }}>Click to see</p>
+              </button>
             )}
           </div>
-
-          {/* Breeding Management */}
-          {horse.type === 'mare' && (
-            <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
-              <div style={{ marginBottom: DS.spacing.lg }}>
-                <label style={{...styles.label, display: 'flex', alignItems: 'center', gap: DS.spacing.md}}>
-                  <input
-                    type="checkbox"
-                    checked={onList}
-                    onChange={(e) => {
-                      setOnList(e.target.checked);
-                      onToggleBreedingList(horse.id, e.target.checked);
-                    }}
-                    style={{ width: '20px', height: '20px', cursor: 'pointer' }}
-                  />
-                  On 2026 Breeding List
-                </label>
-              </div>
-
-              <div style={{ marginBottom: DS.spacing.lg }}>
-                <label style={styles.label}>Breeding Status</label>
-                <select
-                  value={status}
-                  onChange={(e) => {
-                    setStatus(e.target.value);
-                    onUpdateStatus(horse.id, e.target.value);
-                  }}
-                  style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getStatusColor(status)}`}}
-                >
-                  <option value="">Select status...</option>
-                  {BREEDING_STATUSES.map(s => (
-                    <option key={s} value={s}>{s}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label style={styles.label}>Planned Stallion</label>
-                <input
-                  type="text"
-                  value={stallion}
-                  onChange={(e) => {
-                    setStallion(e.target.value);
-                    onUpdateStallion(horse.id, e.target.value);
-                  }}
-                  placeholder="e.g., Vitalis"
-                  style={{...styles.input, marginTop: DS.spacing.sm}}
-                />
-              </div>
-            </div>
-          )}
 
           {/* Tabs */}
           <div style={{
             display: 'flex',
-            gap: DS.spacing.sm,
+            gap: DS.spacing.xl,
             marginTop: DS.spacing.xl,
             marginBottom: DS.spacing.lg,
             borderBottom: `1px solid ${DS.colors.border}`,
           }}>
-            {['timeline', 'pedigree', 'files'].map(tab => (
+            {[
+              { key: 'timeline', label: 'Timeline & Actions' },
+              { key: 'documents', label: 'Documents' },
+              { key: 'pedigree', label: 'Pedigree' },
+            ].map(tab => (
               <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key)}
                 style={{
                   background: 'transparent',
                   border: 'none',
                   padding: `${DS.spacing.md} 0`,
-                  borderBottom: activeTab === tab ? `2px solid ${DS.colors.primary}` : 'transparent',
-                  color: activeTab === tab ? DS.colors.primary : DS.colors.textMuted,
-                  fontWeight: activeTab === tab ? DS.typography.weight.semibold : DS.typography.weight.normal,
+                  borderBottom: activeTab === tab.key ? `2px solid ${DS.colors.primary}` : '2px solid transparent',
+                  color: activeTab === tab.key ? DS.colors.primary : DS.colors.textMuted,
+                  fontWeight: activeTab === tab.key ? DS.typography.weight.semibold : DS.typography.weight.normal,
                   cursor: 'pointer',
                   fontSize: DS.typography.size.base,
-                  textTransform: 'capitalize',
                   transition: 'all 0.2s ease',
                 }}
               >
-                {tab === 'timeline' && '📅 Timeline'}
-                {tab === 'pedigree' && '🐴 Pedigree'}
-                {tab === 'files' && '📄 Files'}
+                {tab.label}
               </button>
             ))}
           </div>
 
-          {/* Timeline Tab */}
+          {/* Timeline & Actions Tab */}
           {activeTab === 'timeline' && (
             <>
-              <h2 style={styles.h2}>Events</h2>
+              {/* Breeding summary — read-only snapshot for a bred mare. */}
+              {isMare && pregnancy && (
+                <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+                  <h3 style={{...styles.h3, marginBottom: DS.spacing.lg}}>Breeding Summary</h3>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: DS.spacing.lg }}>
+                    <div>
+                      <div style={styles.label}>Bred To</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.xs, fontWeight: DS.typography.weight.semibold}}>{stallion || '—'}</p>
+                    </div>
+                    <div>
+                      <div style={styles.label}>Semen Type</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.xs, fontWeight: DS.typography.weight.semibold}}>{pregnancy.semenType || '—'}</p>
+                    </div>
+                    <div>
+                      <div style={styles.label}>Breeding Date</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.xs, fontWeight: DS.typography.weight.semibold}}>{pregnancy.bredDate ? shortDate(pregnancy.bredDate) : '—'}</p>
+                    </div>
+                    <div>
+                      <div style={styles.label}>Days in Foal</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.xs, fontWeight: DS.typography.weight.semibold}}>{pregnancy.elapsed} days</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Manage breeding — collapsible editable controls (mares only). */}
+              {isMare && (
+                <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+                  <button
+                    onClick={() => setShowManage(v => !v)}
+                    style={{ width: '100%', background: 'transparent', border: 'none', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 0, fontFamily: DS.typography.family.base }}
+                  >
+                    <span style={styles.h3}>Manage Breeding</span>
+                    <ChevronDown size={20} color={DS.colors.textMuted} style={{ transform: showManage ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s ease' }} />
+                  </button>
+                  {showManage && (
+                    <div style={{ marginTop: DS.spacing.lg }}>
+                      <label style={{...styles.label, display: 'flex', alignItems: 'center', gap: DS.spacing.md, marginBottom: DS.spacing.lg}}>
+                        <input type="checkbox" checked={onList} onChange={(e) => { setOnList(e.target.checked); onToggleBreedingList(horse.id, e.target.checked); }} style={{ width: '20px', height: '20px', cursor: 'pointer' }} />
+                        On 2026 Breeding List
+                      </label>
+
+                      <div style={{ marginBottom: DS.spacing.lg }}>
+                        <label style={styles.label}>Breeding Status</label>
+                        <select value={status} onChange={(e) => { setStatus(e.target.value); onUpdateStatus(horse.id, e.target.value); }} style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getStatusColor(status)}`}}>
+                          <option value="">Select status...</option>
+                          {BREEDING_STATUSES.map(s => (<option key={s} value={s}>{s}</option>))}
+                        </select>
+                      </div>
+
+                      <div style={{ marginBottom: DS.spacing.lg }}>
+                        <label style={styles.label}>Planned Stallion</label>
+                        <input type="text" value={stallion} onChange={(e) => { setStallion(e.target.value); onUpdateStallion(horse.id, e.target.value); }} placeholder="e.g., Vitalis" style={{...styles.input, marginTop: DS.spacing.sm}} />
+                      </div>
+
+                      <div>
+                        <label style={styles.label}>Lifecycle Status</label>
+                        <select value={horse.status || ''} onChange={(e) => onUpdateHorseStatus(horse.id, e.target.value)} style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getHorseStatusColor(horse.status)}`}}>
+                          <option value="">Select status...</option>
+                          {HORSE_STATUSES.map(s => (<option key={s} value={s}>{s}</option>))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Non-mares keep an editable lifecycle status here. */}
+              {!isMare && (
+                <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+                  <label style={styles.label}>Status</label>
+                  <select value={horse.status || ''} onChange={(e) => onUpdateHorseStatus(horse.id, e.target.value)} style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white, border: `1.5px solid ${getHorseStatusColor(horse.status)}`}}>
+                    <option value="">Select status...</option>
+                    {HORSE_STATUSES.map(s => (<option key={s} value={s}>{s}</option>))}
+                  </select>
+                </div>
+              )}
+
+              <h2 style={styles.h2}>Timeline</h2>
               {horseEvents.length === 0 ? (
                 <div style={{...styles.card, textAlign: 'center', marginLeft: 0, marginRight: 0}}>
                   <p style={styles.bodySmall}>No events recorded yet</p>
                 </div>
               ) : (
-                horseEvents.map(event => (
+                horseEvents.map(event => {
+                  const day = eventDay(event.date);
+                  return (
                   <div key={event.id} style={{...styles.card, marginLeft: 0, marginRight: 0}}>
                     {editingItemId === event.id ? renderItemEditor('event') : (
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
-                        <div style={{ flex: 1 }}>
-                          <h3 style={styles.h3}>{event.title}</h3>
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{event.detail}</p>
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>{relativeDate(event.date)}</p>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: DS.spacing.md }}>
+                        <div style={{ width: '40px', height: '40px', flexShrink: 0, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px', background: `${getEventColor(event)}22`, border: `1px solid ${DS.colors.border}` }}>
+                          {getEventIcon(event)}
                         </div>
-                        <div style={{ display: 'flex', gap: DS.spacing.sm, flexShrink: 0 }}>
-                          <button
-                            onClick={() => startEditItem('event', event)}
-                            style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
-                            title="Edit"
-                          >
-                            <Edit2 size={18} />
-                          </button>
-                          <button
-                            onClick={() => onDeleteEvent(event.id)}
-                            style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
-                            title="Delete"
-                          >
-                            <Trash2 size={18} />
-                          </button>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <h3 style={styles.h3}>{event.title}</h3>
+                          <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
+                            {mediumDate(event.date)}{event.detail ? ` • ${event.detail}` : ''}
+                          </p>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: DS.spacing.xs, flexShrink: 0 }}>
+                          {day != null && (
+                            <div style={{ textAlign: 'right', lineHeight: 1.1 }}>
+                              <div style={{...styles.bodySmall, color: DS.colors.textMuted}}>Day</div>
+                              <div style={{...styles.body, fontWeight: DS.typography.weight.semibold, color: DS.colors.textSecondary}}>{day}</div>
+                            </div>
+                          )}
+                          <div style={{ display: 'flex', gap: DS.spacing.xs }}>
+                            <button onClick={() => startEditItem('event', event)} style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Edit"><Edit2 size={16} /></button>
+                            <button onClick={() => onDeleteEvent(event.id)} style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Delete"><Trash2 size={16} /></button>
+                          </div>
                         </div>
                       </div>
                     )}
                   </div>
-                ))
+                  );
+                })
               )}
 
-              <h2 style={{...styles.h2, marginTop: DS.spacing.xl}}>Actions</h2>
+              <h2 style={{...styles.h2, marginTop: DS.spacing.xl}}>Actions Due</h2>
               {horseActions.length === 0 ? (
                 <div style={{...styles.card, textAlign: 'center', marginLeft: 0, marginRight: 0}}>
                   <p style={styles.bodySmall}>No actions scheduled</p>
                 </div>
               ) : (
-                horseActions.map(action => (
+                horseActions.map(action => {
+                  const badge = action.priority ? PRIORITY_BADGE[action.priority] : null;
+                  return (
                   <div key={action.id} style={{...styles.card, marginLeft: 0, marginRight: 0, opacity: action.done ? 0.6 : 1, background: action.done ? DS.colors.bgAlt : DS.colors.white}}>
                     {editingItemId === action.id ? renderItemEditor('action') : (
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DS.spacing.md }}>
-                      <div style={{ flex: 1 }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: DS.spacing.md }}>
+                      <input type="checkbox" checked={!!action.done} onChange={() => onToggleAction && onToggleAction(action.id)} style={{ width: '20px', height: '20px', cursor: 'pointer', marginTop: '2px', flexShrink: 0 }} title={action.done ? 'Mark not done' : 'Mark done'} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
                         <h3 style={{...styles.h3, textDecoration: action.done ? 'line-through' : 'none'}}>{action.title}</h3>
-                        {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.sm}}>{action.note}</p>}
-                        <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>Due: {relativeDate(action.dueDate)}</p>
+                        {action.note && <p style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>{action.note}</p>}
+                        <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>Due: {mediumDate(action.dueDate)}</p>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, flexShrink: 0 }}>
-                        <button
-                          onClick={() => startEditItem('action', action)}
-                          style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
-                          title="Edit"
-                        >
-                          <Edit2 size={18} />
-                        </button>
-                        <button
-                          onClick={() => onDeleteAction(action.id)}
-                          style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.sm, display: 'flex', alignItems: 'center' }}
-                          title="Delete"
-                        >
-                          <Trash2 size={18} />
-                        </button>
-                        {action.done && (
-                          <div style={{
-                            width: '32px',
-                            height: '32px',
-                            borderRadius: '50%',
-                            background: DS.colors.success,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            fontSize: '18px',
-                            color: 'white',
-                            fontWeight: DS.typography.weight.bold,
-                          }}>
-                            ✓
-                          </div>
+                        {badge && (
+                          <span style={{ background: badge.bg, color: 'white', borderRadius: DS.radius.sm, padding: '3px 8px', fontSize: DS.typography.size.xs, fontWeight: DS.typography.weight.bold, letterSpacing: '0.04em' }}>{badge.label}</span>
                         )}
+                        <button onClick={() => startEditItem('action', action)} style={{ background: 'transparent', border: 'none', color: DS.colors.primary, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Edit"><Edit2 size={16} /></button>
+                        <button onClick={() => onDeleteAction(action.id)} style={{ background: 'transparent', border: 'none', color: DS.colors.error, cursor: 'pointer', padding: DS.spacing.xs, display: 'flex', alignItems: 'center' }} title="Delete"><Trash2 size={16} /></button>
                       </div>
                     </div>
                     )}
                   </div>
-                ))
+                  );
+                })
               )}
             </>
           )}
 
-          {/* Pedigree Tab */}
+          {/* Pedigree Tab — lineage plus the horse's static details. */}
           {activeTab === 'pedigree' && (
             <>
-              <h2 style={styles.h2}>Pedigree</h2>
+              <h2 style={styles.h2}>Details</h2>
+              <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: DS.spacing.lg, marginBottom: horse.additionalInfo ? DS.spacing.lg : 0 }}>
+                  <div>
+                    <div style={styles.label}>Breed</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.breed}</p>
+                  </div>
+                  <div>
+                    <div style={styles.label}>Age</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{age} years old</p>
+                  </div>
+                  <div>
+                    <div style={styles.label}>Color</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.color}</p>
+                  </div>
+                  <div>
+                    <div style={styles.label}>{horse.dateOfBirth ? 'Date of Birth' : 'Born'}</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.dateOfBirth ? parseLocalDate(horse.dateOfBirth).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : horse.yob}</p>
+                  </div>
+                  {horse.owner && (
+                    <div>
+                      <div style={styles.label}>Owner</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.owner}</p>
+                    </div>
+                  )}
+                  {horse.discipline && (
+                    <div>
+                      <div style={styles.label}>Discipline</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.discipline}</p>
+                    </div>
+                  )}
+                  {horse.size && (
+                    <div>
+                      <div style={styles.label}>Size</div>
+                      <p style={{...styles.body, marginTop: DS.spacing.sm}}>{horse.size}</p>
+                    </div>
+                  )}
+                </div>
+                {horse.additionalInfo && (
+                  <div style={{ paddingTop: DS.spacing.md, borderTop: `1px solid ${DS.colors.border}` }}>
+                    <div style={styles.label}>Additional Information</div>
+                    <p style={{...styles.body, marginTop: DS.spacing.sm, whiteSpace: 'pre-wrap'}}>{horse.additionalInfo}</p>
+                  </div>
+                )}
+              </div>
+
+              <h2 style={{...styles.h2, marginTop: DS.spacing.xl}}>Pedigree</h2>
               <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
                 <div style={{ marginBottom: DS.spacing.lg }}>
                   <div style={styles.label}>Sire</div>
@@ -1097,10 +1659,10 @@ function HorseDetailScreen({ horse, events, actions, onBack, onUpdateStatus, onU
             </>
           )}
 
-          {/* Files Tab */}
-          {activeTab === 'files' && (
+          {/* Documents Tab */}
+          {activeTab === 'documents' && (
             <>
-              <h2 style={styles.h2}>Files & Documents</h2>
+              <h2 style={styles.h2}>Documents</h2>
               <div style={{...styles.card, marginLeft: 0, marginRight: 0}}>
                 {!showFileUpload ? (
                   <button
@@ -1438,11 +2000,14 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
   const [editingConfirmation, setEditingConfirmation] = useState(null);
   const [chatMode, setChatMode] = useState('log'); // 'log' or 'ask'
 
-  // Infer the structured fields the user wants out of a free-form chat message:
-  // the category, the mare, an action that was taken (with the date it was taken),
-  // an action item to schedule (with its due date), and an additional note. Any
-  // field can be left blank — a message can describe only something that happened,
-  // only an upcoming reminder, or both at once. Everything is editable afterwards.
+  // Turn a free-form chat message into a reviewable event: which mare it is
+  // about, what kind of event it is (insemination, ultrasound, ovulation,
+  // pregnancy/heartbeat check, lutalyse, intensive monitoring, double ovulation,
+  // uterine issue, pregnancy loss, foaling), and the date/time and any details
+  // stated. Everything derived from the type — the title, the follow-up actions,
+  // and the resulting breeding status — is filled in by deriveEvent so the
+  // preview, the editor, and what gets saved all stay in sync. Every field is
+  // editable afterwards from the Edit Event modal.
   const parseInput = (text, fallbackHorse = null) => {
     const lower = text.toLowerCase();
 
@@ -1454,172 +2019,81 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     const horse = horseMatch
       ? horses.find(h => h.barnName.toLowerCase() === horseMatch[0].toLowerCase())
       : fallbackHorse;
+    const name = horse?.nickname || horse?.barnName || 'the mare';
 
-    const mareLabel = horse?.nickname || horse?.barnName || 'the mare';
+    // When the event happened (a relative reference like "yesterday" wins over an
+    // explicit calendar date), defaulting to today, and the time of day. When the
+    // note doesn't state a time, fall back to the moment the update is logged so
+    // the event is stamped with a real time rather than left blank.
+    const date = parseRelativeDate(lower) || parseExplicitDate(text) || today();
+    const time = parseTime(lower) || nowTime();
 
-    // Pull timing signals out of the text.
-    // A relative day reference ("yesterday", "last Sunday", "3 days ago") wins
-    // over an explicit calendar date; they rarely co-occur, and resolving the
-    // spoken-relative form is what lets a past event be logged on its real day.
-    const explicitDate = parseRelativeDate(lower) || parseExplicitDate(text);  // "yesterday" / "May 28th, 2026"
-    const dayNumberMatch = lower.match(/\bday\s+(\d+)\b/);  // "day 28" -> day of the cycle
-    const dayNumber = dayNumberMatch ? parseInt(dayNumberMatch[1], 10) : null;
-    // "in 28 days" / "in 2 weeks" -> a FUTURE offset from today. A trailing
-    // "ago" means the number is in the past and is handled by the relative-date
-    // parser above, so it must not also be read as a future offset here.
-    const agoSignal = /\bago\b/.test(lower);
-    const daysMatch = lower.match(/(\d+)\s*(?:day|days)\b/);
-    const weeksMatch = lower.match(/(\d+)\s*(?:week|weeks)\b/);
-    let daysOffset = 0;
-    if (daysMatch && dayNumber === null && !agoSignal) daysOffset = parseInt(daysMatch[1], 10);
-    else if (weeksMatch && !agoSignal) daysOffset = parseInt(weeksMatch[1], 10) * 7;
+    const eventType = classifyEventType(lower);
 
-    // Category of the action being logged.
-    let category = 'check';
-    if (/\bfoaled?\s*out\b|\bfoaled\b|\bfoaling\b|gave birth|\bdelivered\b/.test(lower)) category = 'foaled';
-    else if (/\bshort[\s-]?cycl/.test(lower)) category = 'short-cycle';
-    else if (/\b(bred|breed|breeding|inseminat|covered|live cover|\bai\b)\b/.test(lower)) category = 'breed';
-    else if (/\b(administer|administered|drug|inject|injected|dose|dosed|gave|medication|meds?|regumate|altrenogest|oxytocin|prostaglandin|lutalyse|estrumate|hcg|chorulon|deslorelin|sucromate|progesterone|p4)\b/.test(lower)) category = 'drug';
+    // Semen type ("Inseminate Roma fresh Vitalis"), kept lowercase for the title.
+    const semenRaw =
+      /frozen/.test(lower) ? 'frozen' :
+      /chilled|cooled|cool\b/.test(lower) ? 'chilled' :
+      /natural|live\s*cover|pasture/.test(lower) ? 'natural' :
+      /fresh/.test(lower) ? 'fresh' : '';
 
-    // Named drug, if any, so "gave Regumate" reads back as "Administered Regumate".
-    const DRUGS = ['regumate', 'altrenogest', 'oxytocin', 'prostaglandin', 'lutalyse', 'estrumate', 'hcg', 'chorulon', 'deslorelin', 'sucromate', 'progesterone'];
-    const drugRaw = DRUGS.find(d => lower.includes(d));
-    const drugName = drugRaw ? drugRaw.charAt(0).toUpperCase() + drugRaw.slice(1) : null;
+    // Follicle sizes from "36 right 36 left" / "right 36 left 38".
+    const rightMatch = lower.match(/(\d+)\s*(?:mm)?\s*right\b/) || lower.match(/\bright\s*(\d+)/);
+    const leftMatch = lower.match(/(\d+)\s*(?:mm)?\s*left\b/) || lower.match(/\bleft\s*(\d+)/);
+    const follicleRight = rightMatch ? rightMatch[1] : '';
+    const follicleLeft = leftMatch ? leftMatch[1] : '';
 
-    // A specific check/task named in the message.
-    const checkTask =
-      /heart ?beat/.test(lower) ? 'Heartbeat check' :
-      /ultra ?sound|\bscan\b/.test(lower) ? 'Ultrasound check' :
-      /pregnan|preg ?check/.test(lower) ? 'Pregnancy check' :
-      /teased|teaser/.test(lower) ? 'Teased' :
-      /\bcheck\b/.test(lower) ? 'Check' : null;
+    // A positive vs negative pregnancy-check result.
+    const result =
+      /no\s+embryo|not\s+(?:in\s+foal|pregnant)|negative|\bempty\b|came?\s+back\s+open/.test(lower) ? 'negative' :
+      /embryo|in\s*foal|pregnant|positive|heartbeat/.test(lower) ? 'positive' : '';
 
-    // The most recent breeding date on record for this mare. A "day N" reminder
-    // is counted from when she was bred, not from today.
-    const breedAnchor = () => {
-      if (category === 'breed' && explicitDate) return explicitDate;
-      if (!horse) return null;
-      const bred = events
-        .filter(e => e.horseId === horse.id && (e.type === 'breed' || e.type === 'breeding' || /bred|inseminat/i.test(e.title || '')))
-        .sort((a, b) => parseLocalDate(b.date) - parseLocalDate(a.date));
-      return bred.length ? bred[0].date : null;
-    };
+    // Lutalyse / drug dose, e.g. ".5 lute".
+    const doseMatch = lower.match(/(\d*\.\d+|\d+)\s*(?:ml|cc|mg)?/);
+    const dose = eventType === 'lutalyse' && doseMatch ? doseMatch[1] : '';
 
-    // Did the message describe something that already happened?
-    const takenVerb = /\b(bred|inseminat|covered|teased|administered|gave|injected|dosed|checked|performed|short[\s-]?cycled|foaled|delivered|did|done)\b/.test(lower);
-    // Does it describe something to do later?
-    const scheduleSignal = dayNumber !== null || daysOffset > 0
-      || /\b(remind|reminder|schedule|scheduled|due|need to|needs to|will need|follow ?up|recheck|re-check|book)\b/.test(lower);
-
-    // A recurring "every N hours" check schedule, e.g. "schedule 12 hour checks"
-    // or "start 6 hour checks". When detected we lay out one reminder per
-    // interval across the next few days (3 by default), so foaling-watch style
-    // checks don't have to be entered one at a time.
+    // Intensive-monitoring interval ("12 hour checks", "6 hr checks").
     const intervalMatch = lower.match(/(\d+)\s*-?\s*(?:hour|hr)s?\b/);
-    const seriesDaysMatch = lower.match(/next\s+(\d+)\s+days?/);
-    const wantsSeries = !!intervalMatch
-      && (/check/.test(lower) || /\b(schedule|start|every|begin)\b/.test(lower));
-    let scheduleSeries = null;
-    if (wantsSeries) {
+    let series = null;
+    if (eventType === 'monitoring' && intervalMatch) {
       const intervalHours = Math.max(1, parseInt(intervalMatch[1], 10));
-      const seriesDays = seriesDaysMatch ? Math.max(1, parseInt(seriesDaysMatch[1], 10)) : 3;
-      const count = Math.max(1, Math.floor((seriesDays * 24) / intervalHours));
-      scheduleSeries = {
-        intervalHours,
-        days: seriesDays,
-        count,
-        label: checkTask || 'Check',
-      };
+      series = { intervalHours, days: 3, count: Math.max(1, Math.floor((3 * 24) / intervalHours)) };
     }
 
-    // --- Action taken (becomes a logged event when it has a date) ---
-    // A pure schedule request ("schedule 12 hour checks") describes no past
-    // action, so it never produces an action-taken event.
-    let actionTaken = '';
-    if (takenVerb && !wantsSeries) {
-      if (category === 'breed') actionTaken = /inseminat/.test(lower) ? 'Inseminated' : 'Bred';
-      else if (category === 'short-cycle') actionTaken = 'Short cycled';
-      else if (category === 'foaled') actionTaken = 'Foaled out';
-      else if (category === 'drug') actionTaken = drugName ? `Administered ${drugName}` : 'Administered drug';
-      else actionTaken = checkTask || 'Check';
-    }
-    // If nothing was scheduled and we couldn't spot a past-tense verb, treat the
-    // message as a logged note so the user still gets an event to keep or edit.
-    if (!actionTaken && !scheduleSignal && !wantsSeries) {
-      actionTaken = checkTask || (category === 'breed' ? 'Bred' : category === 'short-cycle' ? 'Short cycled' : category === 'foaled' ? 'Foaled out' : category === 'drug' ? (drugName ? `Administered ${drugName}` : 'Administered drug') : 'Note');
-    }
-    const actionTakenDate = actionTaken ? (explicitDate || today()) : '';
-
-    // The category of what was done — recorded on the logged event.
-    const actionTakenCategory = category;
-
-    // Breeding always schedules a 14-day pregnancy check, even when the message
-    // gives no explicit reminder ("bred Bella today" still books the check).
-    const bredNow = category === 'breed' && !!actionTaken;
-
-    // --- Action item (becomes a scheduled reminder) ---
-    let actionItem = '';
-    let dueDate = '';
-    let actionRequiredCategory = 'check';
-    if (wantsSeries) {
-      const label = scheduleSeries.label;
-      actionItem = `${label === 'Check' ? `Check ${mareLabel}` : label} every ${scheduleSeries.intervalHours}h for ${scheduleSeries.days} days`;
-      actionRequiredCategory = 'check';
-      dueDate = today();
-    } else if (scheduleSignal || bredNow) {
-      if (category === 'breed' && (bredNow || takenVerb)) {
-        actionItem = `Check ${mareLabel} for pregnancy`;
-        actionRequiredCategory = 'check';
-      } else if (checkTask) {
-        actionItem = checkTask;
-        actionRequiredCategory = 'check';
-      } else if (category === 'breed') {
-        actionItem = `Breed ${mareLabel}`;
-        actionRequiredCategory = 'breed';
-      } else if (category === 'drug') {
-        actionItem = drugName ? `Administer ${drugName}` : 'Administer drug';
-        actionRequiredCategory = 'drug';
-      } else if (category === 'short-cycle') {
-        actionItem = `Short cycle ${mareLabel}`;
-        actionRequiredCategory = 'short-cycle';
-      } else if (category === 'foaled') {
-        actionItem = `${mareLabel} foaling due`;
-        actionRequiredCategory = 'foaled';
-      } else {
-        actionItem = 'Reminder';
-        actionRequiredCategory = 'check';
-      }
-      if (dayNumber !== null && !/\(day \d+\)/.test(actionItem)) actionItem += ` (day ${dayNumber})`;
-
-      if (dayNumber !== null) {
-        dueDate = formatDate(addDays(parseLocalDate(breedAnchor() || actionTakenDate || today()), dayNumber));
-      } else if (daysOffset > 0) {
-        dueDate = formatDate(addDays(new Date(), daysOffset));
-      } else if (bredNow) {
-        // Default the pregnancy check to 14 days after the breeding date.
-        dueDate = formatDate(addDays(parseLocalDate(actionTakenDate || today()), 14));
-      } else {
-        dueDate = explicitDate && !takenVerb ? explicitDate : today();
-      }
-    }
-
-    // Breeding-cycle status the message implies, so logging it also moves the
-    // mare's status dropdown/badge (e.g. "bred Bella" -> Inseminated).
-    const breedingStatusUpdate = actionTaken ? inferBreedingStatus(lower, actionTakenCategory) : '';
-
-    return {
+    const fields = {
       horseId: horse?.id || null,
       horseName: horse?.barnName || 'Unknown',
-      actionTakenCategory,
-      actionTaken,
-      actionTakenDate,
-      actionRequiredCategory,
-      actionItem,
-      dueDate,
-      scheduleSeries,
-      breedingStatusUpdate,
+      name,
+      eventType,
+      date,
+      time,
+      semenType: eventType === 'insemination' ? semenRaw : '',
+      stallion: eventType === 'insemination' ? parseStallion(text, horse) : '',
+      follicleRight: (eventType === 'ultrasound' || eventType === 'monitoring') ? follicleRight : '',
+      follicleLeft: (eventType === 'ultrasound' || eventType === 'monitoring') ? follicleLeft : '',
+      dose,
+      result: eventType === 'pregnancy-check' ? result : '',
+      series,
+      // Follow-ups the user spelled out in the message ("recheck in 2 days"),
+      // scheduled on top of anything the event type already implies.
+      extraActions: parseExplicitActions(text, name),
       note: text,
     };
+
+    return { ...fields, ...deriveEvent(fields) };
+  };
+
+  // Recompute everything derived from a confirmation's fields after the user
+  // edits one in the Edit Event modal, so the title, preview details, follow-up
+  // actions, and status stay correct as the event type or any field changes.
+  const recomputeConfirmation = (f) => {
+    const horse = horses.find(h => h.id === f.horseId) || null;
+    const next = {
+      ...f,
+      name: horse?.nickname || horse?.barnName || f.name || 'Unknown',
+      horseName: horse?.barnName || f.horseName || 'Unknown',
+    };
+    return { ...next, ...deriveEvent(next) };
   };
 
   const handleSend = async () => {
@@ -1681,91 +2155,97 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
   };
 
   const handleSaveConfirmation = (confirmData) => {
-    const created = [];
-    if (confirmData.horseId) {
-      // An action taken with a date is recorded as a logged event on the horse's
-      // timeline. With no action-taken text (or no date) nothing is logged.
-      if (confirmData.actionTaken && confirmData.actionTakenDate) {
-        onAddEvent({
-          id: `e${Date.now()}`,
-          horseId: confirmData.horseId,
-          date: confirmData.actionTakenDate,
-          type: confirmData.actionTakenCategory,
-          title: confirmData.actionTaken,
-          detail: confirmData.note || '',
-        });
-        created.push('event');
-      }
+    if (!confirmData.horseId) {
+      const updated = messages.filter(m => m.confirmData?.id !== confirmData.id);
+      setMessages([...updated, { role: 'assistant', text: '⚠️ Pick a mare first — nothing was saved.', timestamp: new Date() }]);
+      return;
+    }
 
-      // A recurring check schedule lays out one reminder per interval across the
-      // requested window, each stamped with the date and time it falls on.
-      if (confirmData.scheduleSeries && confirmData.scheduleSeries.count > 0) {
-        const { intervalHours, count, label } = confirmData.scheduleSeries;
-        const base = Date.now();
-        for (let i = 1; i <= count; i++) {
-          const when = new Date(base + i * intervalHours * 60 * 60 * 1000);
+    const created = [];
+    const base = Date.now();
+
+    // The logged event itself goes on the mare's timeline. The detail string keeps
+    // the semen/stallion/follicle/result wording so the profile's breeding summary
+    // and foaling timeline can read it back.
+    onAddEvent({
+      id: `e${base}`,
+      horseId: confirmData.horseId,
+      date: confirmData.date,
+      time: confirmData.time || '',
+      type: confirmData.eventType,
+      title: confirmData.eventTitle,
+      detail: buildEventDetail(confirmData),
+      note: confirmData.note || '',
+    });
+    created.push('event');
+
+    // Each derived follow-up becomes a scheduled action with its priority. An
+    // intensive-monitoring series expands into one reminder per interval across
+    // its window, each stamped with the time it falls on.
+    (confirmData.actions || []).forEach((a, i) => {
+      if (a.series) {
+        const { intervalHours, count } = a.series;
+        const seriesBase = Date.now();
+        for (let k = 1; k <= count; k++) {
+          const when = new Date(seriesBase + k * intervalHours * 60 * 60 * 1000);
           const timeLabel = when.toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
           onAddAction({
-            id: `a${base + i}`,
+            id: `a${base}_${i}_${k}`,
             horseId: confirmData.horseId,
             category: 'check',
-            title: `${label} (${timeLabel})`,
-            note: confirmData.note || '',
+            title: `${a.title} (${timeLabel})`,
+            note: '',
             dueDate: formatDate(when),
+            priority: a.priority,
             done: false,
           });
         }
-        created.push(`${count} scheduled checks`);
-      } else if (confirmData.actionItem) {
-        // An action item becomes a scheduled reminder, so it surfaces on the horse
-        // profile, the home reminders list, and the calendar on its due date.
+      } else {
         onAddAction({
-          id: `a${Date.now() + 1}`,
+          id: `a${base}_${i}`,
           horseId: confirmData.horseId,
-          category: confirmData.actionRequiredCategory,
-          title: confirmData.actionItem,
-          note: confirmData.note || '',
-          dueDate: confirmData.dueDate || today(),
+          category: a.category || 'check',
+          title: a.title,
+          note: '',
+          dueDate: a.dueDate || today(),
+          priority: a.priority,
           done: false,
         });
-        created.push('action item');
       }
+    });
+    if ((confirmData.actions || []).length) created.push(`${confirmData.actions.length} action${confirmData.actions.length > 1 ? 's' : ''}`);
 
-      // Logging what happened can also advance the mare's breeding-cycle status.
-      if (confirmData.breedingStatusUpdate && onUpdateBreedingStatus) {
-        onUpdateBreedingStatus(confirmData.horseId, confirmData.breedingStatusUpdate);
-        created.push('mare status');
-      }
+    // The event can also advance the mare's breeding-cycle status, which in turn
+    // keeps her foaling estimate / "foals due" listing in step on her profile.
+    if (confirmData.breedingStatusUpdate && onUpdateBreedingStatus) {
+      onUpdateBreedingStatus(confirmData.horseId, confirmData.breedingStatusUpdate);
+      created.push('mare status');
     }
-
-    // Remove the confirmation message and add a success (or "nothing to save") note.
-    const summary = !confirmData.horseId
-      ? `⚠️ Pick a horse first — nothing was saved.`
-      : created.length === 0
-        ? `⚠️ Nothing to save — add an action taken or an action item.`
-        : `✅ Saved ${created.join(', ')} for ${confirmData.horseName}.`;
 
     const updatedMessages = messages.filter(m => m.confirmData?.id !== confirmData.id);
     setMessages([
       ...updatedMessages,
       {
         role: 'assistant',
-        text: summary,
+        text: `✅ Saved ${created.join(', ')} for ${confirmData.horseName}.`,
         timestamp: new Date(),
-        success: created.length > 0,
+        success: true,
       },
     ]);
   };
 
+  // Discard a pending confirmation card without saving anything.
+  const handleCancelConfirmation = (confirmData) => {
+    setMessages(messages.filter(m => m.confirmData?.id !== confirmData.id));
+    if (editingConfirmation?.id === confirmData.id) setEditingConfirmation(null);
+  };
+
   const handleSaveEdit = () => {
     if (editingConfirmation) {
-      // Update the confirmation message with edited data
-      const updatedMessages = messages.map(m =>
-        m.confirmData?.id === editingConfirmation.id
-          ? { ...m, confirmData: editingConfirmation }
-          : m
-      );
-      setMessages(updatedMessages);
+      const recomputed = recomputeConfirmation(editingConfirmation);
+      setMessages(messages.map(m =>
+        m.confirmData?.id === recomputed.id ? { ...m, confirmData: recomputed } : m
+      ));
       setEditingConfirmation(null);
     }
   };
@@ -1884,224 +2364,90 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
                 {/* AI response with confirmation card */}
                 {msg.role === 'assistant' && msg.action === 'confirm' && msg.confirmData && (
                   <div style={{ marginBottom: DS.spacing.lg }}>
-                    <div style={{ marginBottom: DS.spacing.md, textAlign: 'left' }}>
-                      <p style={styles.bodySmall}>{msg.text}</p>
-                    </div>
-
-                    {/* Confirmation Card Preview */}
+                    {/* Preview card — "This will create" */}
                     <div style={{
-                      background: DS.colors.bgAlt,
-                      border: `2px solid ${DS.colors.primary}`,
+                      background: DS.colors.white,
+                      border: `1px solid ${DS.colors.border}`,
+                      borderLeft: `4px solid ${DS.colors.primary}`,
                       borderRadius: DS.radius.lg,
                       padding: DS.spacing.lg,
-                      marginBottom: DS.spacing.md,
+                      boxShadow: DS.shadow.sm,
                     }}>
-                      <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
-                        <div style={styles.label}>Mare</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.horseName}</p>
-                      </div>
+                      <h3 style={{...styles.h3, marginBottom: DS.spacing.lg}}>📋 This will create:</h3>
 
-                      {/* Action taken -> becomes a timeline event */}
-                      <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: DS.spacing.sm }}>
-                          <div style={{...styles.label, color: msg.confirmData.actionTaken ? DS.colors.success : DS.colors.textMuted}}>
-                            ✓ Action Taken
-                          </div>
-                          {msg.confirmData.actionTaken && (
-                            <span style={categoryChip}>{categoryLabel(msg.confirmData.actionTakenCategory)}</span>
-                          )}
-                        </div>
-                        {msg.confirmData.actionTaken ? (
-                          <>
-                            <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold}}>{msg.confirmData.actionTaken}</p>
-                            <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
-                              {msg.confirmData.actionTakenDate ? `on ${relativeDate(msg.confirmData.actionTakenDate)}` : 'No date — won’t be logged'}
-                            </p>
-                          </>
-                        ) : (
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>None</p>
-                        )}
-                      </div>
-
-                      {/* Action item -> becomes a scheduled reminder */}
-                      <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: DS.spacing.sm }}>
-                          <div style={{...styles.label, color: msg.confirmData.actionItem ? DS.colors.gold : DS.colors.textMuted}}>
-                            → Action Required
-                          </div>
-                          {msg.confirmData.actionItem && (
-                            <span style={categoryChip}>{categoryLabel(msg.confirmData.actionRequiredCategory)}</span>
-                          )}
-                        </div>
-                        {msg.confirmData.actionItem ? (
-                          <>
-                            <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold}}>{msg.confirmData.actionItem}</p>
-                            <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
-                              {msg.confirmData.scheduleSeries
-                                ? `${msg.confirmData.scheduleSeries.count} reminders, every ${msg.confirmData.scheduleSeries.intervalHours}h starting ${relativeDate(msg.confirmData.dueDate)}`
-                                : msg.confirmData.dueDate ? `Due ${relativeDate(msg.confirmData.dueDate)}` : 'Due today'}
-                            </p>
-                          </>
-                        ) : (
-                          <p style={{...styles.bodySmall, marginTop: DS.spacing.sm, color: DS.colors.textMuted}}>None</p>
-                        )}
-                      </div>
-
-                      {/* Mare status update */}
-                      {msg.confirmData.breedingStatusUpdate && (
-                        <div style={{ marginBottom: DS.spacing.md, paddingBottom: DS.spacing.md, borderBottom: `1px solid ${DS.colors.border}` }}>
-                          <div style={styles.label}>Mare Status →</div>
-                          <p style={{...styles.body, marginTop: DS.spacing.sm, fontWeight: DS.typography.weight.semibold, color: getStatusColor(msg.confirmData.breedingStatusUpdate)}}>
-                            {msg.confirmData.breedingStatusUpdate}
+                      {/* EVENT */}
+                      <div style={styles.label}>Event</div>
+                      <div style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm }}>
+                        <p style={{...styles.body, fontWeight: DS.typography.weight.bold}}>{msg.confirmData.eventTitle}</p>
+                        {(msg.confirmData.eventDetails || []).map(d => (
+                          <p key={d.label} style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
+                            {d.label}: <strong style={{ color: DS.colors.text }}>{d.value}</strong>
                           </p>
+                        ))}
+                      </div>
+
+                      {/* AUTO-CREATED ACTIONS */}
+                      {(msg.confirmData.actions || []).length > 0 && (
+                        <div style={{ marginTop: DS.spacing.lg, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
+                          <div style={styles.label}>Auto-Created Actions</div>
+                          {msg.confirmData.actions.map((a, idx) => (
+                            <div key={idx} style={{ background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm }}>
+                              <p style={{...styles.bodySmall, color: DS.colors.textMuted}}>{idx + 1}. {a.label}</p>
+                              <p style={{...styles.body, fontWeight: DS.typography.weight.bold, marginTop: DS.spacing.xs}}>{a.title}</p>
+                              <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textSecondary}}>
+                                Due: <strong style={{ color: DS.colors.text }}>{a.series ? `every ${a.series.intervalHours}h` : (a.dueTime ? `${a.dueDate} ${a.dueTime}` : a.dueDate)}</strong>
+                                {a.priority ? <> | Priority: <strong style={{ color: DS.colors.text }}>{a.priority.toUpperCase()}</strong></> : null}
+                              </p>
+                            </div>
+                          ))}
                         </div>
                       )}
 
-                      <div style={{ marginBottom: DS.spacing.md }}>
-                        <div style={styles.label}>Additional Note</div>
-                        <p style={{...styles.body, marginTop: DS.spacing.sm}}>{msg.confirmData.note || '—'}</p>
-                      </div>
+                      {/* MARE STATUS — shown as the step she moves from → to */}
+                      {msg.confirmData.breedingStatusUpdate && (() => {
+                        const currentStatus = horses.find(h => h.id === msg.confirmData.horseId)?.breedingStatus;
+                        return (
+                          <div style={{ marginTop: DS.spacing.lg, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
+                            <div style={styles.label}>Mare Status</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: DS.spacing.sm, marginTop: DS.spacing.sm, flexWrap: 'wrap' }}>
+                              {currentStatus && currentStatus !== msg.confirmData.breedingStatusUpdate && (
+                                <>
+                                  <span style={{...styles.body, color: getStatusColor(currentStatus), textDecoration: 'line-through', opacity: 0.7}}>
+                                    {currentStatus}
+                                  </span>
+                                  <span style={{...styles.body, color: DS.colors.textMuted}}>→</span>
+                                </>
+                              )}
+                              <span style={{...styles.body, fontWeight: DS.typography.weight.semibold, color: getStatusColor(msg.confirmData.breedingStatusUpdate)}}>
+                                {msg.confirmData.breedingStatusUpdate}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       {/* Action Buttons */}
-                      <div style={{ display: 'flex', gap: DS.spacing.md, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
+                      <div style={{ display: 'flex', gap: DS.spacing.md, marginTop: DS.spacing.lg, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
                         <button
                           onClick={() => handleSaveConfirmation(msg.confirmData)}
-                          style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1, fontSize: DS.typography.size.sm}}
+                          style={{...styles.buttonBase, background: DS.colors.success, color: 'white', flex: 1, fontSize: DS.typography.size.sm}}
                         >
                           <Check size={16} /> Save
                         </button>
                         <button
-                          onClick={() => setEditingConfirmation(msg.confirmData)}
+                          onClick={() => setEditingConfirmation(recomputeConfirmation(msg.confirmData))}
                           style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1, fontSize: DS.typography.size.sm}}
                         >
                           <Edit2 size={16} /> Edit
                         </button>
+                        <button
+                          onClick={() => handleCancelConfirmation(msg.confirmData)}
+                          style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1, fontSize: DS.typography.size.sm}}
+                        >
+                          <X size={16} /> Cancel
+                        </button>
                       </div>
                     </div>
-
-                    {/* Edit Modal */}
-                    {editingConfirmation?.id === msg.confirmData.id && (
-                      <div style={{...styles.card, marginLeft: 0, marginRight: 0, marginTop: DS.spacing.md, background: DS.colors.bgAlt, border: `2px solid ${DS.colors.gold}`}}>
-                        <h3 style={{...styles.h3, color: DS.colors.gold}}>Edit Action</h3>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Horse</label>
-                          <select
-                            value={editingConfirmation.horseId || ''}
-                            onChange={(e) => {
-                              const selected = horses.find(h => h.id === e.target.value);
-                              setEditingConfirmation({
-                                ...editingConfirmation,
-                                horseId: selected ? selected.id : null,
-                                horseName: selected ? selected.barnName : 'Unknown',
-                              });
-                            }}
-                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
-                          >
-                            <option value="">Unknown</option>
-                            {horses.map(h => (
-                              <option key={h.id} value={h.id}>{h.barnName}</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Taken Category</label>
-                          <select
-                            value={editingConfirmation.actionTakenCategory}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTakenCategory: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
-                          >
-                            {ACTION_CATEGORIES.map(c => (
-                              <option key={c.key} value={c.key}>{c.label}</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Taken</label>
-                          <input
-                            type="text"
-                            value={editingConfirmation.actionTaken}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTaken: e.target.value})}
-                            placeholder="Leave blank if nothing was done"
-                            style={{...styles.input, marginTop: DS.spacing.sm}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Date Taken</label>
-                          <input
-                            type="date"
-                            value={editingConfirmation.actionTakenDate}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionTakenDate: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Required Category</label>
-                          <select
-                            value={editingConfirmation.actionRequiredCategory}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionRequiredCategory: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
-                          >
-                            {ACTION_CATEGORIES.map(c => (
-                              <option key={c.key} value={c.key}>{c.label}</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Action Required</label>
-                          <input
-                            type="text"
-                            value={editingConfirmation.actionItem}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, actionItem: e.target.value})}
-                            placeholder="Leave blank for no reminder"
-                            style={{...styles.input, marginTop: DS.spacing.sm}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Due Date</label>
-                          <input
-                            type="date"
-                            value={editingConfirmation.dueDate}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, dueDate: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Additional Note</label>
-                          <textarea
-                            value={editingConfirmation.note}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, note: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '80px', fontFamily: DS.typography.family.base}}
-                          />
-                        </div>
-
-                        <div style={{ marginTop: DS.spacing.lg }}>
-                          <label style={styles.label}>Mare Status (optional)</label>
-                          <select
-                            value={editingConfirmation.breedingStatusUpdate || ''}
-                            onChange={(e) => setEditingConfirmation({...editingConfirmation, breedingStatusUpdate: e.target.value})}
-                            style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
-                          >
-                            <option value="">Leave unchanged</option>
-                            {BREEDING_STATUSES.map(s => (
-                              <option key={s} value={s}>{s}</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div style={{ display: 'flex', gap: DS.spacing.md, marginTop: DS.spacing.lg }}>
-                          <button onClick={handleSaveEdit} style={{...styles.buttonBase, ...styles.buttonPrimary, flex: 1}}>Save Changes</button>
-                          <button onClick={() => setEditingConfirmation(null)} style={{...styles.buttonBase, ...styles.buttonSecondary, flex: 1}}>Cancel</button>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 )}
 
@@ -2136,6 +2482,185 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
           </div>
         )}
       </div>
+
+      {/* Edit Event modal — opens over the chat when "Edit" is tapped on a
+          preview card. Editing any field live-recomputes the title, the details,
+          and the auto-created actions so the preview matches what gets saved. */}
+      {editingConfirmation && (
+        <div
+          onClick={() => setEditingConfirmation(null)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(26, 23, 21, 0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: DS.spacing.lg, zIndex: 300 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: DS.colors.white, borderRadius: DS.radius.lg, width: '100%', maxWidth: '520px', maxHeight: '90vh', overflowY: 'auto', boxShadow: DS.shadow.md }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: DS.spacing.lg, borderBottom: `1px solid ${DS.colors.border}` }}>
+              <h2 style={styles.h2}>Edit Event</h2>
+              <button onClick={() => setEditingConfirmation(null)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: DS.colors.textSecondary, display: 'flex' }} title="Close"><X size={22} /></button>
+            </div>
+
+            <div style={{ padding: DS.spacing.lg }}>
+              {/* Mare */}
+              <div>
+                <label style={styles.label}>Mare</label>
+                <select
+                  value={editingConfirmation.horseId || ''}
+                  onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, horseId: e.target.value || null }))}
+                  style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                >
+                  <option value="">Unknown</option>
+                  {horses.map(h => (<option key={h.id} value={h.id}>{h.barnName}</option>))}
+                </select>
+              </div>
+
+              {/* Event Type */}
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Event Type</label>
+                <select
+                  value={editingConfirmation.eventType}
+                  onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, eventType: e.target.value }))}
+                  style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                >
+                  {EVENT_TYPES.map(t => (<option key={t.key} value={t.key}>{t.label}</option>))}
+                </select>
+              </div>
+
+              {/* Date */}
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Date</label>
+                <input
+                  type="date"
+                  value={editingConfirmation.date || ''}
+                  onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, date: e.target.value }))}
+                  style={{...styles.input, marginTop: DS.spacing.sm}}
+                />
+              </div>
+
+              {/* Time */}
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Time (HH:MM)</label>
+                <input
+                  type="text"
+                  value={editingConfirmation.time || ''}
+                  placeholder="e.g. 11:00"
+                  onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, time: e.target.value }))}
+                  style={{...styles.input, marginTop: DS.spacing.sm}}
+                />
+              </div>
+
+              {/* Semen Type + Stallion — insemination only */}
+              {editingConfirmation.eventType === 'insemination' && (
+                <>
+                  <div style={{ marginTop: DS.spacing.lg }}>
+                    <label style={styles.label}>Semen Type</label>
+                    <select
+                      value={editingConfirmation.semenType || ''}
+                      onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, semenType: e.target.value }))}
+                      style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                    >
+                      <option value="">Not set</option>
+                      {['fresh', 'frozen', 'chilled', 'natural'].map(s => (<option key={s} value={s}>{s}</option>))}
+                    </select>
+                  </div>
+                  <div style={{ marginTop: DS.spacing.lg }}>
+                    <label style={styles.label}>Stallion Name</label>
+                    <input
+                      type="text"
+                      value={editingConfirmation.stallion || ''}
+                      onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, stallion: e.target.value }))}
+                      style={{...styles.input, marginTop: DS.spacing.sm}}
+                    />
+                  </div>
+                </>
+              )}
+
+              {/* Follicle sizes — ultrasound / intensive monitoring */}
+              {(editingConfirmation.eventType === 'ultrasound' || editingConfirmation.eventType === 'monitoring') && (
+                <div style={{ marginTop: DS.spacing.lg, display: 'flex', gap: DS.spacing.md }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={styles.label}>Follicle Right (mm)</label>
+                    <input
+                      type="text"
+                      value={editingConfirmation.follicleRight || ''}
+                      onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, follicleRight: e.target.value }))}
+                      style={{...styles.input, marginTop: DS.spacing.sm}}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={styles.label}>Follicle Left (mm)</label>
+                    <input
+                      type="text"
+                      value={editingConfirmation.follicleLeft || ''}
+                      onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, follicleLeft: e.target.value }))}
+                      style={{...styles.input, marginTop: DS.spacing.sm}}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Dose — lutalyse */}
+              {editingConfirmation.eventType === 'lutalyse' && (
+                <div style={{ marginTop: DS.spacing.lg }}>
+                  <label style={styles.label}>Dose</label>
+                  <input
+                    type="text"
+                    value={editingConfirmation.dose || ''}
+                    onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, dose: e.target.value }))}
+                    style={{...styles.input, marginTop: DS.spacing.sm}}
+                  />
+                </div>
+              )}
+
+              {/* Result — pregnancy check */}
+              {editingConfirmation.eventType === 'pregnancy-check' && (
+                <div style={{ marginTop: DS.spacing.lg }}>
+                  <label style={styles.label}>Result</label>
+                  <select
+                    value={editingConfirmation.result || ''}
+                    onChange={(e) => setEditingConfirmation(recomputeConfirmation({ ...editingConfirmation, result: e.target.value }))}
+                    style={{...styles.input, marginTop: DS.spacing.sm, background: DS.colors.white}}
+                  >
+                    <option value="">Not stated</option>
+                    <option value="positive">Positive — in foal</option>
+                    <option value="negative">Negative — not in foal</option>
+                  </select>
+                </div>
+              )}
+
+              {/* Notes */}
+              <div style={{ marginTop: DS.spacing.lg }}>
+                <label style={styles.label}>Notes</label>
+                <textarea
+                  value={editingConfirmation.note || ''}
+                  placeholder="Additional notes..."
+                  onChange={(e) => setEditingConfirmation({ ...editingConfirmation, note: e.target.value })}
+                  style={{...styles.input, marginTop: DS.spacing.sm, minHeight: '80px', fontFamily: DS.typography.family.base}}
+                />
+              </div>
+
+              {/* Auto-created actions preview */}
+              {(editingConfirmation.actions || []).length > 0 && (
+                <div style={{ marginTop: DS.spacing.lg, background: DS.colors.bgAlt, borderLeft: `3px solid ${DS.colors.primary}`, borderRadius: DS.radius.md, padding: DS.spacing.lg }}>
+                  <p style={{...styles.bodySmall, fontWeight: DS.typography.weight.semibold, color: DS.colors.text}}>Auto-created actions will be:</p>
+                  <ul style={{ margin: `${DS.spacing.sm} 0 0`, paddingLeft: DS.spacing.xl }}>
+                    {editingConfirmation.actions.map((a, i) => (
+                      <li key={i} style={{...styles.bodySmall, marginTop: DS.spacing.xs}}>
+                        {a.bullet} ({a.series ? `every ${a.series.intervalHours}h` : (a.dueTime ? `${a.dueDate} ${a.dueTime}` : a.dueDate)})
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: DS.spacing.md, padding: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
+              <button onClick={() => setEditingConfirmation(null)} style={{...styles.buttonBase, ...styles.buttonSecondary}}>Cancel</button>
+              <button onClick={handleSaveEdit} style={{...styles.buttonBase, ...styles.buttonPrimary}}>Update &amp; Save</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Fixed Input at Bottom */}
       <div style={{ 
@@ -3113,7 +3638,32 @@ export default function App() {
   };
 
   const handleUpdateStatus = (horseId, status) => {
-    const horse = updateHorse(horseId, { breedingStatus: status });
+    const changes = { breedingStatus: status };
+
+    // Keep the mare's foaling estimate in step with her breeding status, so that
+    // whichever way the status moves — a chat log or the profile dropdown — the
+    // foaling timeline on her profile and the "foals due" list on the home
+    // screen reflect it without anyone re-entering a due date by hand.
+    if (status === 'Confirmed in foal') {
+      const horse = horses.find(h => h.id === horseId);
+      const lastBred = events
+        .filter(e => e.horseId === horseId
+          && (e.type === 'breed' || e.type === 'breeding' || /\b(bred|inseminat|covered)\b/i.test(e.title || '')))
+        .sort((a, b) => parseLocalDate(b.date) - parseLocalDate(a.date))[0];
+      // Only fill in an estimate when she has a breeding on record and no due
+      // date has been set already, so a hand-entered date is never overwritten.
+      if (lastBred && !horse?.foalDueDate) {
+        changes.conceptionDate = lastBred.date;
+        changes.foalDueDate = formatDate(addDays(parseLocalDate(lastBred.date), GESTATION_DAYS));
+      }
+    } else if (status === 'Lost - back open' || status === 'Waiting for cycle' || status === 'Foaled') {
+      // The pregnancy ended (she came back open or foaled out) — drop the
+      // foaling estimate so she no longer shows as due.
+      changes.foalDueDate = null;
+      changes.conceptionDate = null;
+    }
+
+    const horse = updateHorse(horseId, changes);
     if (horse) flash(`${horse.barnName} status updated`);
   };
 
@@ -3235,6 +3785,7 @@ export default function App() {
           onSaveTimelineItem={handleSaveTimelineItem}
           onDeleteEvent={handleDeleteEvent}
           onDeleteAction={handleDeleteAction}
+          onToggleAction={handleToggleAction}
         />
       ) : activeTab === 'home' ? (
         <HomeScreen
