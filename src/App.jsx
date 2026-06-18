@@ -376,6 +376,50 @@ const parseExplicitActions = (text, name) => {
   return out;
 };
 
+// Signals tying a still-open follow-up to a note that reports it was carried
+// out. If an action's title matches `title`, that action is treated as resolved
+// only when the note also matches `note`. Checked before the generic verb test
+// below so a *specific* check (pregnancy, heartbeat, ovulation, …) is resolved
+// only by a note that plausibly reports that particular check — never by an
+// unrelated update about the same mare.
+const ACTION_DONE_SIGNALS = [
+  { title: /pregnan|14[\s-]?day|7[\s-]?day|embryo/i, note: /pregnan|in\s*foal|not\s+(?:in\s+foal|pregnant)|embryo|negative|positive|\bopen\b|\bempty\b|checked|scan|ultra/i },
+  { title: /heartbeat|28[\s-]?day/i, note: /heartbeat|checked|scan|ultra/i },
+  { title: /ovulation/i, note: /ovulat|checked|scan|ultra/i },
+  { title: /uterine|flush/i, note: /flush|uterine|uterus/i },
+  { title: /heat|cycle\s*restart/i, note: /\bheat\b|in\s*season|cycl|\bbred\b|inseminat/i },
+  { title: /monitor/i, note: /monitor|checked|scan|ultra/i },
+];
+
+// Past-tense / completion verbs meaning "I did the thing the reminder asked for".
+// Used to resolve a plain check / recheck / follow-up reminder that carries no
+// more specific signal of its own.
+const ACTION_DONE_VERBS = /\b(check(?:ed)?|recheck(?:ed)?|look(?:ed)?|examin(?:ed)?|scann?(?:ed)?|saw|did|done|complet(?:ed)?|gave|administer(?:ed)?|teas(?:ed)?|flush(?:ed)?|bred|inseminat(?:ed)?|covered|monitor(?:ed)?)\b/i;
+
+// Given a freshly typed note, return the mare's still-open actions it reports as
+// done, so the chat can offer to tick them off — each shown for confirm/deny in
+// the preview before anything is actually marked done. Conservative by design:
+// only this mare's pending actions are candidates; a specific check resolves
+// only on a matching note; and a generic check/recheck/follow-up/watch resolves
+// only when the note states it was actually carried out (e.g. an action to
+// "check Thelma" is resolved by "checked Thelma, not pregnant yet"). Returns the
+// matched action records unchanged.
+const findResolvedActions = (text, horseId, actions) => {
+  if (!horseId || !Array.isArray(actions)) return [];
+  const lower = text.toLowerCase();
+  return actions.filter((a) => {
+    if (a.horseId !== horseId || a.done) return false;
+    const title = `${a.title || ''}`.toLowerCase();
+    for (const sig of ACTION_DONE_SIGNALS) {
+      if (sig.title.test(title)) return sig.note.test(lower);
+    }
+    if (/check|recheck|follow|watch/i.test(title) || a.category === 'check') {
+      return ACTION_DONE_VERBS.test(text);
+    }
+    return false;
+  });
+};
+
 // Given a fully-resolved set of event fields, derive everything that flows from
 // the event type: the display title, the detail rows shown on the preview card,
 // the follow-up actions to auto-create (each with its due date, priority, and a
@@ -1994,7 +2038,7 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
 // CHAT SCREEN
 // ============================================================================
 
-function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, onUpdateBreedingStatus }) {
+function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, onUpdateBreedingStatus, onResolveActions }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [editingConfirmation, setEditingConfirmation] = useState(null);
@@ -2043,10 +2087,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     const follicleRight = rightMatch ? rightMatch[1] : '';
     const follicleLeft = leftMatch ? leftMatch[1] : '';
 
-    // A positive vs negative pregnancy-check result.
+    // A positive vs negative pregnancy-check result. Negatives are checked
+    // first and cover negation phrasing ("did not see an embryo", "didn't find
+    // a sac") so a note isn't mis-read as positive just because the word
+    // "embryo"/"pregnant" appears inside a negation.
     const result =
-      /no\s+embryo|not\s+(?:in\s+foal|pregnant)|negative|\bempty\b|came?\s+back\s+open/.test(lower) ? 'negative' :
-      /embryo|in\s*foal|pregnant|positive|heartbeat/.test(lower) ? 'positive' : '';
+      /(?:did|does|do|could|can|was|were|is|are|wo|would)\s*n['’]?o?t\s+(?:see|saw|seen|find|found|detect|confirm)|n['’]t\s+(?:see|saw|seen|find|found|detect|confirm)|\bno\s+(?:embryo|sac|pregnan|sign|heartbeat|foal|fetus)|not\s+(?:in\s*foal|pregnant)|negative|\bempty\b|came?\s+back\s+open|\bopen\b/.test(lower) ? 'negative' :
+      /embryo|in\s*foal|pregnant|positive|heartbeat|confirmed/.test(lower) ? 'positive' : '';
 
     // Lutalyse / drug dose, e.g. ".5 lute".
     const doseMatch = lower.match(/(\d*\.\d+|\d+)\s*(?:ml|cc|mg)?/);
@@ -2080,7 +2127,12 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
       note: text,
     };
 
-    return { ...fields, ...deriveEvent(fields) };
+    // Still-open reminders for this mare that the note reports as done, surfaced
+    // in the preview so they can be ticked off alongside logging the event.
+    const resolvedActions = findResolvedActions(text, horse?.id || null, actions)
+      .map((a) => ({ id: a.id, title: a.title, confirmed: true }));
+
+    return { ...fields, ...deriveEvent(fields), resolvedActions };
   };
 
   // Recompute everything derived from a confirmation's fields after the user
@@ -2093,7 +2145,13 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
       name: horse?.nickname || horse?.barnName || f.name || 'Unknown',
       horseName: horse?.barnName || f.horseName || 'Unknown',
     };
-    return { ...next, ...deriveEvent(next) };
+    // Re-match resolved reminders against the (possibly edited) mare/note so the
+    // preview never offers to close out another mare's actions after an edit,
+    // preserving any the user has already unchecked for ones that still match.
+    const priorConfirmed = new Map((f.resolvedActions || []).map((a) => [a.id, a.confirmed]));
+    const resolvedActions = findResolvedActions(next.note || '', next.horseId, actions)
+      .map((a) => ({ id: a.id, title: a.title, confirmed: priorConfirmed.get(a.id) !== false }));
+    return { ...next, ...deriveEvent(next), resolvedActions };
   };
 
   // The most recent breeding date on record for a horse, so Claude can resolve
@@ -2307,6 +2365,17 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
     });
     if ((confirmData.actions || []).length) created.push(`${confirmData.actions.length} action${confirmData.actions.length > 1 ? 's' : ''}`);
 
+    // Close out any still-open reminders the note resolved (e.g. logging a check
+    // ticks off the "check this mare" action). Only the ones still checked in the
+    // preview are touched, since the user can uncheck any they don't want closed.
+    const resolvedIds = (confirmData.resolvedActions || [])
+      .filter((a) => a.confirmed !== false)
+      .map((a) => a.id);
+    if (resolvedIds.length && onResolveActions) {
+      onResolveActions(resolvedIds);
+      created.push(`${resolvedIds.length} action${resolvedIds.length > 1 ? 's' : ''} marked done`);
+    }
+
     // The event can also advance the mare's breeding-cycle status, which in turn
     // keeps her foaling estimate / "foals due" listing in step on her profile.
     if (confirmData.breedingStatusUpdate && onUpdateBreedingStatus) {
@@ -2330,6 +2399,23 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
   const handleCancelConfirmation = (confirmData) => {
     setMessages(messages.filter(m => m.confirmData?.id !== confirmData.id));
     if (editingConfirmation?.id === confirmData.id) setEditingConfirmation(null);
+  };
+
+  // Toggle whether a matched "marking action as done" suggestion will be applied
+  // when the card is saved, so the user can confirm or deny each one inline.
+  const toggleResolvedAction = (confirmData, actionId) => {
+    setMessages(messages.map(m => {
+      if (m.confirmData?.id !== confirmData.id) return m;
+      return {
+        ...m,
+        confirmData: {
+          ...m.confirmData,
+          resolvedActions: (m.confirmData.resolvedActions || []).map(a =>
+            a.id === actionId ? { ...a, confirmed: a.confirmed === false } : a
+          ),
+        },
+      };
+    }));
   };
 
   const handleSaveEdit = () => {
@@ -2491,6 +2577,34 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
                                 {a.priority ? <> | Priority: <strong style={{ color: DS.colors.text }}>{a.priority.toUpperCase()}</strong></> : null}
                               </p>
                             </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* RESOLVED ACTIONS — "Marking action X as done" */}
+                      {(msg.confirmData.resolvedActions || []).length > 0 && (
+                        <div style={{ marginTop: DS.spacing.lg, paddingTop: DS.spacing.lg, borderTop: `1px solid ${DS.colors.border}` }}>
+                          <div style={styles.label}>Marking Actions Done</div>
+                          {msg.confirmData.resolvedActions.map((a) => (
+                            <label
+                              key={a.id}
+                              style={{ display: 'flex', alignItems: 'flex-start', gap: DS.spacing.md, background: DS.colors.bgAlt, borderRadius: DS.radius.md, padding: DS.spacing.lg, marginTop: DS.spacing.sm, cursor: 'pointer' }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={a.confirmed !== false}
+                                onChange={() => toggleResolvedAction(msg.confirmData, a.id)}
+                                style={{ width: '20px', height: '20px', cursor: 'pointer', marginTop: '1px', flexShrink: 0 }}
+                              />
+                              <span style={{ flex: 1 }}>
+                                <p style={{...styles.body, fontWeight: DS.typography.weight.bold, textDecoration: a.confirmed === false ? 'line-through' : 'none', opacity: a.confirmed === false ? 0.5 : 1}}>
+                                  ✓ Mark “{a.title}” as done
+                                </p>
+                                <p style={{...styles.bodySmall, marginTop: DS.spacing.xs, color: DS.colors.textMuted}}>
+                                  {a.confirmed === false ? 'Will stay open' : 'This note resolves it'}
+                                </p>
+                              </span>
+                            </label>
                           ))}
                         </div>
                       )}
@@ -3793,6 +3907,21 @@ export default function App() {
     persistItem('actions', updated);
   };
 
+  // Mark a batch of actions done at once — used when a chat note resolves one or
+  // more open reminders. Done in a single state update (and one persist call per
+  // record) so several toggles can't clobber one another off a stale snapshot.
+  const handleResolveActions = (actionIds) => {
+    if (!actionIds || !actionIds.length) return;
+    const ids = new Set(actionIds);
+    const updatedOnes = actions
+      .filter(a => ids.has(a.id) && !a.done)
+      .map(a => ({ ...a, done: true }));
+    if (!updatedOnes.length) return;
+    const byId = new Map(updatedOnes.map(a => [a.id, a]));
+    setActions(actions.map(a => byId.get(a.id) || a));
+    updatedOnes.forEach(a => persistItem('actions', a));
+  };
+
   const handleDeleteAction = (actionId) => {
     setActions(actions.filter(a => a.id !== actionId));
     removeItem('actions', actionId);
@@ -3908,6 +4037,7 @@ export default function App() {
             flash(`Action added!`);
           }}
           onUpdateBreedingStatus={handleUpdateStatus}
+          onResolveActions={handleResolveActions}
         />
       ) : activeTab === 'calendar' ? (
         <CalendarScreen actions={actions} events={events} horses={horses} />
