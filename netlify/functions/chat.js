@@ -8,12 +8,12 @@
 //                  Returns { parsed: {...} }.
 //
 // Connection: requests go to the Netlify AI Gateway, NOT directly to Anthropic.
-// Netlify injects ANTHROPIC_BASE_URL (the gateway endpoint) and ANTHROPIC_API_KEY
-// (the gateway credential) into every server context — so the function never
-// holds a real provider key, and billing flows through the Netlify account. We
-// use the official Anthropic SDK, which auto-detects those variables and sets
-// the required `anthropic-version` header itself, instead of hand-rolling the
-// HTTP call (the previous hardcoded call to api.anthropic.com is what failed).
+// Netlify injects the gateway credentials into every server context — so the
+// function never holds a real provider key, and billing flows through the Netlify
+// account. We use the official Anthropic SDK pointed at the gateway, instead of
+// hand-rolling the HTTP call (the previous hardcoded call to api.anthropic.com is
+// what originally failed). See getClient() for why the credential and base URL
+// must be taken from the SAME source.
 //
 // NOTE: the AI Gateway variables are only injected once the site has a published
 // production deploy with AI features enabled. Until then `getClient()` below
@@ -49,23 +49,35 @@ const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 // callers can fall back gracefully.
 //
 // Routing is always through the Netlify AI Gateway and NEVER the public Anthropic
-// API. Netlify injects ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL into every server
-// context; we pass them to the SDK explicitly, falling back to the always-present
-// NETLIFY_AI_GATEWAY_* pair if only those reach the runtime. If neither pair is
-// present (which happens on a deploy whose runtime predates AI features being
-// enabled), we raise a clear, catchable error instead of letting the SDK throw a
-// cryptic one, so log-mode can fall back to the rule-based parser and ask-mode can
-// surface a helpful message.
+// API. The credential and the base URL must come from the SAME source — they are a
+// matched pair, and crossing them makes the gateway reject the request. This is the
+// production failure the earlier fixes missed: Netlify injects ANTHROPIC_API_KEY +
+// ANTHROPIC_BASE_URL *together*, but the moment a project sets its own
+// ANTHROPIC_API_KEY in the Netlify env, Netlify deliberately stops injecting
+// ANTHROPIC_BASE_URL. Reading each variable independently (`ANTHROPIC_API_KEY ||
+// NETLIFY_AI_GATEWAY_KEY` for the key, `ANTHROPIC_BASE_URL || NETLIFY_AI_GATEWAY_BASE_URL`
+// for the URL) then pairs that custom key with the gateway base URL — a mismatch the
+// gateway answers with an auth error that only shows up in production.
+//
+// So we pick ONE consistent pair. The NETLIFY_AI_GATEWAY_* pair is always injected,
+// always belongs together, and is never affected by project-set provider keys, so we
+// prefer it; we only fall back to the Anthropic-specific pair when BOTH halves of it
+// are present. If no complete pair is available (e.g. a deploy whose runtime predates
+// AI features being enabled), we raise a clear, catchable error instead of letting the
+// SDK throw a cryptic one, so log-mode can fall back to the rule-based parser and
+// ask-mode can surface a helpful message.
 let client;
 const getClient = () => {
   if (client) return client;
-  // Prefer the Anthropic-specific gateway variables (what the SDK auto-detects),
-  // and fall back to the always-present NETLIFY_AI_GATEWAY_* pair so the function
-  // still connects if only those are injected at runtime.
-  const apiKey = process.env.ANTHROPIC_API_KEY || process.env.NETLIFY_AI_GATEWAY_KEY;
-  const baseURL = (
-    process.env.ANTHROPIC_BASE_URL || process.env.NETLIFY_AI_GATEWAY_BASE_URL
-  )?.replace(/\/+$/, '');
+  // Prefer the always-present, internally-consistent gateway pair; only use the
+  // Anthropic-specific pair when both of its halves are injected together.
+  let apiKey = process.env.NETLIFY_AI_GATEWAY_KEY;
+  let baseURL = process.env.NETLIFY_AI_GATEWAY_BASE_URL;
+  if ((!apiKey || !baseURL) && process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_BASE_URL) {
+    apiKey = process.env.ANTHROPIC_API_KEY;
+    baseURL = process.env.ANTHROPIC_BASE_URL;
+  }
+  baseURL = baseURL?.replace(/\/+$/, '');
   if (!apiKey || !baseURL) {
     // None of the gateway variables made it into this runtime. That happens on a
     // deploy whose function runtime predates AI features being enabled — the fix
