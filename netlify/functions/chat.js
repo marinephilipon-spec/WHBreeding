@@ -7,17 +7,20 @@
 //                  into the structured confirmation card the client renders.
 //                  Returns { parsed: {...} }.
 //
-// Connection: requests go to the Netlify AI Gateway, NOT directly to Anthropic.
-// Netlify injects the gateway credentials into every server context — so the
-// function never holds a real provider key, and billing flows through the Netlify
-// account. We use the official Anthropic SDK pointed at the gateway, instead of
-// hand-rolling the HTTP call (the previous hardcoded call to api.anthropic.com is
-// what originally failed). See getClient() for why the credential and base URL
-// must be taken from the SAME source.
+// Connection: requests go through the Netlify AI Gateway, NOT directly to
+// Anthropic. The function uses the official Anthropic SDK with its zero-config
+// constructor — Netlify injects the matching ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL
+// pair into every server context, and the SDK auto-detects them. There is no manual
+// key/URL handling: the function never holds a real provider key, billing flows
+// through the Netlify account, and there is no chance of crossing a custom key with
+// the wrong base URL.
 //
 // NOTE: the AI Gateway variables are only injected once the site has a published
 // production deploy with AI features enabled. Until then `getClient()` below
 // throws the "AI Gateway is not configured" error that surfaces in the chat.
+// `getClient()` accepts EITHER credential path the gateway can provide — the
+// provider-specific Anthropic pair, or the always-present gateway key/URL — so a
+// runtime that received only one of them still works.
 import Anthropic from '@anthropic-ai/sdk';
 
 const MODEL = 'claude-sonnet-4-6';
@@ -48,50 +51,58 @@ const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 // Single place that talks to the gateway. Throws on a transport/HTTP error so
 // callers can fall back gracefully.
 //
-// Routing is always through the Netlify AI Gateway and NEVER the public Anthropic
-// API. The credential and the base URL must come from the SAME source — they are a
-// matched pair, and crossing them makes the gateway reject the request. This is the
-// production failure the earlier fixes missed: Netlify injects ANTHROPIC_API_KEY +
-// ANTHROPIC_BASE_URL *together*, but the moment a project sets its own
-// ANTHROPIC_API_KEY in the Netlify env, Netlify deliberately stops injecting
-// ANTHROPIC_BASE_URL. Reading each variable independently (`ANTHROPIC_API_KEY ||
-// NETLIFY_AI_GATEWAY_KEY` for the key, `ANTHROPIC_BASE_URL || NETLIFY_AI_GATEWAY_BASE_URL`
-// for the URL) then pairs that custom key with the gateway base URL — a mismatch the
-// gateway answers with an auth error that only shows up in production.
+// Routing is always through the Netlify AI Gateway, never the public Anthropic
+// API. There are two credential paths and we accept whichever one the runtime
+// received:
 //
-// So we pick ONE consistent pair. The NETLIFY_AI_GATEWAY_* pair is always injected,
-// always belongs together, and is never affected by project-set provider keys, so we
-// prefer it; we only fall back to the Anthropic-specific pair when BOTH halves of it
-// are present. If no complete pair is available (e.g. a deploy whose runtime predates
-// AI features being enabled), we raise a clear, catchable error instead of letting the
-// SDK throw a cryptic one, so log-mode can fall back to the rule-based parser and
-// ask-mode can surface a helpful message.
+//   1. Preferred — the provider-specific pair. Netlify injects a matched
+//      ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL and the SDK's zero-config
+//      constructor auto-detects them, so we never pick the key and URL apart by
+//      hand (the previous version did, and crossing a project-set key with the
+//      gateway URL is exactly what failed in production).
+//
+//   2. Fallback — the gateway's own credentials. NETLIFY_AI_GATEWAY_KEY and
+//      NETLIFY_AI_GATEWAY_BASE_URL are always present once AI features are on,
+//      even in the rare runtime where the provider-specific pair did not land
+//      (e.g. a project that set its own ANTHROPIC_API_KEY, which suppresses the
+//      matching ANTHROPIC_BASE_URL injection). We point the SDK straight at the
+//      gateway's Anthropic route and authenticate with a Bearer token, exactly
+//      as the AI Gateway REST contract specifies.
+//
+// Only when NEITHER path is available — a deploy whose runtime predates AI
+// features being enabled — do we raise a clear, catchable error instead of
+// letting the SDK throw a cryptic one, so log-mode can fall back to the
+// rule-based parser and ask-mode can surface a helpful message.
 let client;
 const getClient = () => {
   if (client) return client;
-  // Prefer the always-present, internally-consistent gateway pair; only use the
-  // Anthropic-specific pair when both of its halves are injected together.
-  let apiKey = process.env.NETLIFY_AI_GATEWAY_KEY;
-  let baseURL = process.env.NETLIFY_AI_GATEWAY_BASE_URL;
-  if ((!apiKey || !baseURL) && process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_BASE_URL) {
-    apiKey = process.env.ANTHROPIC_API_KEY;
-    baseURL = process.env.ANTHROPIC_BASE_URL;
+
+  // Path 1: zero-config — the SDK reads the Netlify-injected ANTHROPIC_API_KEY /
+  // ANTHROPIC_BASE_URL pair on its own.
+  if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_BASE_URL) {
+    client = new Anthropic();
+    return client;
   }
-  baseURL = baseURL?.replace(/\/+$/, '');
-  if (!apiKey || !baseURL) {
-    // None of the gateway variables made it into this runtime. That happens on a
-    // deploy whose function runtime predates AI features being enabled — the fix
-    // is a fresh production deploy with AI features on, not a code change. Raise a
-    // clear, catchable error so log-mode falls back to the offline parser and
-    // ask-mode shows a helpful message.
-    const err = new Error(
-      'AI Gateway is not configured. Ensure the site has a production deploy with AI features enabled.',
-    );
-    err.code = 'GATEWAY_NOT_CONFIGURED';
-    throw err;
+
+  // Path 2: the provider pair is absent but the gateway's own credentials are
+  // present. Route through the gateway's /anthropic path with Bearer auth.
+  if (process.env.NETLIFY_AI_GATEWAY_KEY && process.env.NETLIFY_AI_GATEWAY_BASE_URL) {
+    const gatewayBase = process.env.NETLIFY_AI_GATEWAY_BASE_URL.replace(/\/+$/, '');
+    client = new Anthropic({
+      authToken: process.env.NETLIFY_AI_GATEWAY_KEY,
+      baseURL: `${gatewayBase}/anthropic`,
+    });
+    return client;
   }
-  client = new Anthropic({ apiKey, baseURL });
-  return client;
+
+  // No credentials at all. The fix is a fresh production deploy with AI features
+  // on, not a code change. Raise a clear, catchable error so log-mode falls back
+  // to the offline parser and ask-mode shows a helpful message.
+  const err = new Error(
+    'AI Gateway is not configured. Ensure the site has a production deploy with AI features enabled.',
+  );
+  err.code = 'GATEWAY_NOT_CONFIGURED';
+  throw err;
 };
 
 // One transport-level retry smooths over the gateway's occasional cold-start 5xx

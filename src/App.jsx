@@ -2260,9 +2260,10 @@ function HomeScreen({ horses, actions, onSelectHorse, onNavigateToChat, onToggle
 // CHAT SCREEN
 // ============================================================================
 
-// Temporarily hides the "Ask Questions" chat mode. The ask-question code path is
-// kept intact below — flip this back to true to re-enable the feature.
-const ENABLE_ASK_QUESTIONS = false;
+// Controls the "Ask Questions" chat mode toggle. When true, the keeper can switch
+// the chat into a free-form Q&A mode ("how many horses do I have?") answered by the
+// AI from their live breeding data.
+const ENABLE_ASK_QUESTIONS = true;
 
 function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, onUpdateBreedingStatus, onResolveActions }) {
   const [messages, setMessages] = useState([]);
@@ -3207,7 +3208,7 @@ function ChatScreen({ horses, actions, events, onBack, onAddEvent, onAddAction, 
                 handleSend();
               }
             }}
-            placeholder={inputFocused ? '' : 'What happened today? (e.g. Bred Thelma today, check again in 2 weeks)'}
+            placeholder={inputFocused ? '' : (chatMode === 'ask' ? 'Ask a question (e.g. How many horses do I have?)' : 'What happened today? (e.g. Bred Thelma today, check again in 2 weeks)')}
             style={{...styles.input, flex: 1, minHeight: '44px', maxHeight: '100px', resize: 'none', borderColor: input ? DS.colors.primary : DS.colors.border}}
           />
           <button onClick={handleSend} style={{...styles.buttonBase, ...styles.buttonPrimary, width: '44px', height: '44px', padding: 0, minWidth: 'auto', flexShrink: 0}}>

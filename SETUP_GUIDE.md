@@ -100,9 +100,6 @@ build/
   functions = "netlify/functions"
   publish = "dist"
 
-[env]
-  ANTHROPIC_API_KEY = ""
-
 [[redirects]]
   from = "/*"
   to = "/index.html"
@@ -187,14 +184,20 @@ git push origin main
 5. **Publish directory:** `dist`
 6. Click **Deploy site**
 
-## Step 8: Add API Key to Netlify
+## Step 8: Enable AI Gateway
 
-1. Netlify Dashboard → Site settings → Build & Deploy → Environment
-2. Click **Edit variables**
-3. Add:
-   - **Key:** `ANTHROPIC_API_KEY`
-   - **Value:** Your API key from https://console.anthropic.com/api/keys
-4. Save and redeploy
+The chat is powered by Claude through the **Netlify AI Gateway** — there is no
+provider API key to manage. Netlify injects the gateway credentials into the
+function automatically once AI features are enabled.
+
+1. Netlify Dashboard → Site configuration → Build & deploy → **Build with AI**
+2. **Manage AI features** and ensure AI Gateway is enabled
+3. Trigger a fresh production deploy so the function runtime picks up the
+   injected gateway credentials
+
+> Do **not** set your own `ANTHROPIC_API_KEY` in the Netlify environment. A
+> project-set key makes Netlify stop injecting the matching gateway base URL,
+> which breaks the connection. Leave the AI variables to the gateway.
 
 ## Step 9: Test Deployment
 
@@ -215,7 +218,7 @@ git push origin main
 
 **Chat not working?**
 - Check Netlify function logs: Dashboard → Functions → chat
-- Verify API key is set in Netlify environment
+- Verify AI features are enabled and the site has a fresh production deploy
 
 **Build failing?**
 - Run `npm install` locally

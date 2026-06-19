@@ -4,7 +4,7 @@
 1. Create GitHub repo
 2. Add 3 files
 3. Connect Netlify
-4. Add API key
+4. Enable AI Gateway
 5. Done! ✨
 
 ---
@@ -142,14 +142,17 @@ git push origin main
 
 ---
 
-## STEP 6: Add API Key
+## STEP 6: Enable AI Gateway
+
+The chat runs on Claude through the Netlify AI Gateway — no API key needed.
 
 1. Netlify Dashboard → Your site
-2. **Settings** → **Build & Deploy** → **Environment**
-3. **Add variable:**
-   - Key: `ANTHROPIC_API_KEY`
-   - Value: Your API key
-4. **Redeploy** site
+2. **Site configuration** → **Build & deploy** → **Build with AI**
+3. **Manage AI features** → ensure AI Gateway is enabled
+4. **Redeploy** site so the function picks up the gateway credentials
+
+> Don't add your own `ANTHROPIC_API_KEY` — it disables the gateway base URL
+> injection and breaks the chat.
 
 ---
 
