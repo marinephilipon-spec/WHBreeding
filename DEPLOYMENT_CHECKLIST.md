@@ -180,26 +180,26 @@ export default defineConfig({
    - Takes 2-3 minutes
    - Site will be live with a Netlify subdomain
 
-### PHASE 3: API Setup (2 minutes)
+### PHASE 3: AI Gateway Setup (2 minutes)
 
-1. **Get API Key:**
-   - Go to https://console.anthropic.com/api/keys
-   - Create new key (or use existing)
-   - Copy the key
+The chat is powered by Claude through the **Netlify AI Gateway**. Netlify injects
+the gateway credentials automatically — there is no provider API key to obtain or
+store.
 
-2. **Add to Netlify:**
+1. **Enable AI features:**
    - Netlify Dashboard → Your site
-   - **Settings** → **Build & Deploy** → **Environment variables**
-   - Click **Edit variables**
-   - Add new:
-     - Key: `ANTHROPIC_API_KEY`
-     - Value: Your API key from Anthropic
-   - Save
+   - **Site configuration** → **Build & deploy** → **Build with AI**
+   - **Manage AI features** → ensure AI Gateway is enabled
+
+2. **Do NOT set your own `ANTHROPIC_API_KEY`:**
+   - A project-set Anthropic key makes Netlify stop injecting the matching
+     gateway base URL, which breaks the connection. Leave the AI variables to
+     the gateway.
 
 3. **Trigger redeploy:**
-   - Go to **Deployments** 
+   - Go to **Deployments**
    - Click the latest deploy
-   - Click **Redeploy** button
+   - Click **Redeploy** button (so the function picks up the gateway credentials)
 
 4. **Done!** 🎉
    - Your site is live with AI chat enabled
@@ -220,7 +220,7 @@ export default defineConfig({
 
 3. **If chat doesn't work:**
    - Check Netlify function logs
-   - Verify API key is set
+   - Verify AI features are enabled and the site has a fresh production deploy
    - Check browser console for errors
 
 ---
@@ -233,8 +233,8 @@ export default defineConfig({
 - [ ] Pushed to GitHub `main` branch
 - [ ] Netlify connected to GitHub repo
 - [ ] Site is live (check Netlify Dashboard)
-- [ ] API key added to Netlify environment
-- [ ] Site redeployed after adding API key
+- [ ] AI features (AI Gateway) enabled in Netlify
+- [ ] Site redeployed so the function picks up gateway credentials
 - [ ] Tested chat - working! ✨
 
 ---
@@ -243,7 +243,7 @@ export default defineConfig({
 
 - **GitHub:** https://github.com/YOUR_USERNAME/WHBreeding
 - **Netlify:** https://app.netlify.com (find your site)
-- **API Key:** https://console.anthropic.com/api/keys
+- **AI Gateway docs:** https://docs.netlify.com/build/ai-gateway/overview/
 - **Live Site:** Check Netlify dashboard for URL
 
 ---
@@ -263,7 +263,8 @@ npm run build
 - Check build logs in Netlify Dashboard
 
 **Chat not working:**
-- Verify API key in Netlify environment
+- Verify AI features (AI Gateway) are enabled in Netlify
+- Confirm the site has a fresh production deploy
 - Check function logs in Netlify
 - Look for errors in browser DevTools
 
