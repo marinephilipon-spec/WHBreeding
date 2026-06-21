@@ -8,22 +8,23 @@
 //                  Returns { parsed: {...} }.
 //
 // Connection: requests go through the Netlify AI Gateway, NOT directly to
-// Anthropic. The function uses the official Anthropic SDK with its zero-config
-// constructor — Netlify injects the matching ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL
-// pair into every server context, and the SDK auto-detects them. There is no manual
-// key/URL handling: the function never holds a real provider key, billing flows
-// through the Netlify account, and there is no chance of crossing a custom key with
-// the wrong base URL.
+// Anthropic. The function talks to the gateway's Anthropic-compatible REST
+// endpoint with a plain `fetch` — no provider SDK is installed or used. Netlify
+// injects the credentials into every server context; the function never holds a
+// real provider key, billing flows through the Netlify account, and there is no
+// chance of crossing a custom key with the wrong base URL.
 //
 // NOTE: the AI Gateway variables are only injected once the site has a published
-// production deploy with AI features enabled. Until then `getClient()` below
-// throws the "AI Gateway is not configured" error that surfaces in the chat.
-// `getClient()` accepts EITHER credential path the gateway can provide — the
-// provider-specific Anthropic pair, or the always-present gateway key/URL — so a
-// runtime that received only one of them still works.
-import Anthropic from '@anthropic-ai/sdk';
+// production deploy with AI features enabled. Until then `getGatewayConfig()`
+// below throws the "AI Gateway is not configured" error that surfaces in the chat.
+// `getGatewayConfig()` accepts EITHER credential path the gateway can provide —
+// the provider-specific Anthropic pair, or the always-present gateway key/URL — so
+// a runtime that received only one of them still works.
 
 const MODEL = 'claude-sonnet-4-6';
+
+// The Anthropic Messages REST API version header the gateway expects.
+const ANTHROPIC_VERSION = '2023-06-01';
 
 // The event types the breeding log understands — kept in sync with EVENT_TYPES
 // in src/App.jsx. The model classifies each note into exactly ONE of these so the
@@ -48,51 +49,59 @@ const EVENT_TYPES = [
 
 const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 
-// Single place that talks to the gateway. Throws on a transport/HTTP error so
-// callers can fall back gracefully.
+// Single place that resolves how to reach the gateway. Returns the request URL
+// and auth headers for the Anthropic Messages endpoint, or throws if no
+// credentials are present so callers can fall back gracefully.
 //
 // Routing is always through the Netlify AI Gateway, never the public Anthropic
 // API. There are two credential paths and we accept whichever one the runtime
 // received:
 //
 //   1. Preferred — the provider-specific pair. Netlify injects a matched
-//      ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL and the SDK's zero-config
-//      constructor auto-detects them, so we never pick the key and URL apart by
-//      hand (the previous version did, and crossing a project-set key with the
-//      gateway URL is exactly what failed in production).
+//      ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL. We POST to `${ANTHROPIC_BASE_URL}
+//      /v1/messages` and authenticate with the standard `x-api-key` header.
 //
 //   2. Fallback — the gateway's own credentials. NETLIFY_AI_GATEWAY_KEY and
 //      NETLIFY_AI_GATEWAY_BASE_URL are always present once AI features are on,
 //      even in the rare runtime where the provider-specific pair did not land
 //      (e.g. a project that set its own ANTHROPIC_API_KEY, which suppresses the
-//      matching ANTHROPIC_BASE_URL injection). We point the SDK straight at the
-//      gateway's Anthropic route and authenticate with a Bearer token, exactly
-//      as the AI Gateway REST contract specifies.
+//      matching ANTHROPIC_BASE_URL injection). We POST to the gateway's
+//      `/anthropic/v1/messages` route and authenticate with a Bearer token,
+//      exactly as the AI Gateway REST contract specifies.
 //
 // Only when NEITHER path is available — a deploy whose runtime predates AI
-// features being enabled — do we raise a clear, catchable error instead of
-// letting the SDK throw a cryptic one, so log-mode can fall back to the
-// rule-based parser and ask-mode can surface a helpful message.
-let client;
-const getClient = () => {
-  if (client) return client;
+// features being enabled — do we raise a clear, catchable error so log-mode can
+// fall back to the rule-based parser and ask-mode can surface a helpful message.
+let gatewayConfig;
+const getGatewayConfig = () => {
+  if (gatewayConfig) return gatewayConfig;
 
-  // Path 1: zero-config — the SDK reads the Netlify-injected ANTHROPIC_API_KEY /
-  // ANTHROPIC_BASE_URL pair on its own.
+  // Path 1: the provider-specific Anthropic pair.
   if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_BASE_URL) {
-    client = new Anthropic();
-    return client;
+    const base = process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '');
+    gatewayConfig = {
+      url: `${base}/v1/messages`,
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+      },
+    };
+    return gatewayConfig;
   }
 
-  // Path 2: the provider pair is absent but the gateway's own credentials are
-  // present. Route through the gateway's /anthropic path with Bearer auth.
+  // Path 2: the gateway's own credentials, routed through its /anthropic path.
   if (process.env.NETLIFY_AI_GATEWAY_KEY && process.env.NETLIFY_AI_GATEWAY_BASE_URL) {
-    const gatewayBase = process.env.NETLIFY_AI_GATEWAY_BASE_URL.replace(/\/+$/, '');
-    client = new Anthropic({
-      authToken: process.env.NETLIFY_AI_GATEWAY_KEY,
-      baseURL: `${gatewayBase}/anthropic`,
-    });
-    return client;
+    const base = process.env.NETLIFY_AI_GATEWAY_BASE_URL.replace(/\/+$/, '');
+    gatewayConfig = {
+      url: `${base}/anthropic/v1/messages`,
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        authorization: `Bearer ${process.env.NETLIFY_AI_GATEWAY_KEY}`,
+      },
+    };
+    return gatewayConfig;
   }
 
   // No credentials at all. The fix is a fresh production deploy with AI features
@@ -105,17 +114,43 @@ const getClient = () => {
   throw err;
 };
 
+// Issue one Messages request to the gateway over HTTP. `fetch` does not throw on
+// HTTP error statuses, so we surface them as an Error carrying `.status` to match
+// what the retry/fallback logic and the handler's error reporting expect.
+const requestMessages = async (payload) => {
+  const { url, headers } = getGatewayConfig();
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model: MODEL, ...payload }),
+  });
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      detail = await response.text();
+    } catch {
+      // ignore — the status alone is enough to classify the failure.
+    }
+    const err = new Error(`AI Gateway request failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.json();
+};
+
 // One transport-level retry smooths over the gateway's occasional cold-start 5xx
 // and per-minute 429s, which would otherwise surface to the user as a hard error.
 const isTransient = (error) => error?.status === 429 || (error?.status >= 500 && error?.status < 600);
 
 const callClaude = async (payload) => {
   try {
-    return await getClient().messages.create({ model: MODEL, ...payload });
+    return await requestMessages(payload);
   } catch (error) {
     if (!isTransient(error)) throw error;
     await new Promise((resolve) => setTimeout(resolve, 600));
-    return getClient().messages.create({ model: MODEL, ...payload });
+    return requestMessages(payload);
   }
 };
 
